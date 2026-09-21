@@ -1,0 +1,54 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    SISTEMA DE VISUALIZACIÓN DE PIES                        ║
+║                          GUÍA RÁPIDA - MVP v0.1.0                          ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📍 UBICACIÓN
+   C:\Users\juanf\OneDrive\Escritorio\FM Ortopedia\pie-viewer
+
+⚙️  INSTALACIÓN COMPLETA EN 5 MINUTOS
+   
+   1. Windows + R → cmd
+   2. cd "C:\Users\juanf\OneDrive\Escritorio\FM Ortopedia\pie-viewer"
+   3. python -m venv venv
+   4. .\venv\Scripts\activate
+   5. pip install -r requirements.txt
+   6. python -m src.main
+
+🎯 USO BÁSICO
+   
+   Cargar STL:     Ctrl+O o Archivo → Abrir STL
+   Rotar:          Click derecho + arrastrar
+   Zoom:           Rueda del mouse
+   Ver vistas:     Botones panel derecho
+   Salir:          Ctrl+Q
+
+✅ VERIFICAR
+   
+   python -m pytest tests/ -v
+   → Resultado esperado: 24/24 tests passing
+
+📦 INCLUIDO
+   
+   ✓ Parser STL completo (ASCII + Binary)
+   ✓ Validación de geometría
+   ✓ Renderizado 3D con VTK
+   ✓ 7 vistas ortopédicas predefinidas
+   ✓ Interacción 3D completa
+   ✓ Suite de 24 tests
+   ✓ Documentación completa
+
+📖 DOCUMENTACIÓN
+   
+   COMENZAR_AQUI.txt    ← Empezar aquí (guía completa)
+   QUICK_START.md       ← Inicio en 5 minutos
+   RUN_APPLICATION.md   ← Guía de uso
+   README.md            ← Descripción general
+   INSTALACION.md       ← Pasos detallados
+
+🔧 TECNOLOGÍA
+   
+   Python 3.9+  | PyQt6 6.7.1  | VTK 9.3.0
+   NumPy 1.24.3 | SciPy 1.11.3 | pytest 7.4.3
+
+🚀 ¡LISTO! Ejecuta: python -m src.main

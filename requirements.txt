@@ -1,0 +1,6 @@
+PyQt6==6.7.1
+VTK==9.2.0
+numpy>=1.21.0
+scipy>=1.7.0
+pytest>=7.0.0
+reportlab>=4.0.0

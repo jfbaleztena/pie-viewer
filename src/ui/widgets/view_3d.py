@@ -1,0 +1,922 @@
+"""
+VTK 3D Viewer - Canvas para renderizar malla 3D del pie
+
+Responsabilidades:
+- Integrar VTK con PyQt6
+- Cargar y renderizar malla STL
+- Controlar cámara (rotación, zoom, pan)
+- Dibujar plano de apoyo
+- Mapear colores por altura
+- Seleccionar puntos en la malla (picking)
+"""
+
+import numpy as np
+from typing import Optional, Tuple, List
+import logging
+
+from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal
+
+# vtkmodules es modular: estos imports no se usan directamente, pero registran
+# los backends concretos (OpenGL, fuentes de texto) contra las fábricas
+# abstractas de VTK. Sin ellos, vtkRenderWindow()/vtkTextActor() se crean pero
+# no dibujan nada (sin lanzar ningún error) porque no hay implementación real
+# detrás de la clase abstracta.
+import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
+import vtkmodules.vtkRenderingFreeType  # noqa: F401
+
+from vtkmodules.vtkRenderingCore import vtkRenderWindow, vtkRenderer, vtkActor
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
+from vtkmodules.vtkRenderingCore import (
+    vtkPolyDataMapper, vtkProperty, vtkCellPicker, vtkTextActor, vtkWindowToImageFilter
+)
+from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
+from vtkmodules.vtkFiltersSources import vtkSphereSource, vtkLineSource
+from vtkmodules.vtkIOImage import vtkPNGWriter
+
+from src.models.foot_model import FootModel
+
+logger = logging.getLogger(__name__)
+
+# Defensive imports for VTK compatibility across versions
+try:
+    from vtkmodules.vtkRenderingQt import QVTKRenderWindowInteractor
+except ImportError:
+    try:
+        from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+    except ImportError:
+        logger.warning("Could not import QVTKRenderWindowInteractor - VTK GUI rendering may fail")
+        QVTKRenderWindowInteractor = None
+
+# Try to import vtkPolyDataNormals (not available in all VTK versions)
+try:
+    from vtkmodules.vtkFiltersGeneral import vtkPolyDataNormals
+except ImportError:
+    try:
+        from vtkmodules.vtkFiltersCore import vtkPolyDataNormals
+    except ImportError:
+        logger.warning("vtkPolyDataNormals not available - will render without explicit normal computation")
+        vtkPolyDataNormals = None
+
+
+class VTK3DView(QWidget):
+    """
+    Widget PyQt6 que renderiza modelos 3D usando VTK
+    """
+
+    # Señales
+    point_selected = pyqtSignal(np.ndarray)  # Punto seleccionado en la malla
+    mesh_loaded = pyqtSignal(FootModel)      # Malla cargada
+
+    def __init__(self, parent=None):
+        """
+        Inicializar widget VTK
+
+        Args:
+            parent: Widget padre PyQt6
+        """
+        super().__init__(parent)
+        self.logger = logging.getLogger(__name__)
+        self._interactor_initialized = False
+
+        if QVTKRenderWindowInteractor is None:
+            self.logger.error("VTK rendering not available - QVTKRenderWindowInteractor could not be imported")
+            return
+
+        # Interactor y renderer
+        self.interactor = QVTKRenderWindowInteractor(self)
+        self.render_window = self.interactor.GetRenderWindow()
+        self.renderer = vtkRenderer()
+        self.render_window.AddRenderer(self.renderer)
+
+        # Estado
+        self.current_model: Optional[FootModel] = None
+        self.mesh_actor: Optional[vtkActor] = None
+        self.support_plane_actor: Optional[vtkActor] = None
+        self.axes_actor: Optional[vtkAxesActor] = None
+        # Marcadores de los 3 puntos que definen el plano de apoyo: se
+        # limpian todos juntos (no son mediciones individuales, no tiene
+        # sentido borrar "un punto del plano" sin redefinirlo entero)
+        self.plane_marker_actors: List[vtkActor] = []
+        # Actores (marcador(es) + línea) de cada Measurement, indexados por
+        # su id, para poder borrar una medición puntual sin tocar el resto
+        self.measurement_visuals: dict = {}
+        self.measurement_text_actor: Optional[vtkTextActor] = None
+
+        # Picking de puntos sobre la malla
+        self.picker = vtkCellPicker()
+        self.picker.SetTolerance(0.005)
+        self._picking_enabled = False
+        self._press_pos = None  # QPointF del último LeftButtonPress, o None
+
+        # Esfera de previsualización: sigue al cursor mientras hay un modo de
+        # picking activo, mostrando dónde caería el click antes de hacerlo.
+        # Se crea recién al primer hover (lazy) y se reposiciona in-place en
+        # cada movimiento de mouse, en vez de crear un actor nuevo por frame.
+        self._preview_marker_actor: Optional[vtkActor] = None
+        self._preview_sphere_source: Optional[vtkSphereSource] = None
+
+        # Configurar interacción
+        self.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
+        self.interactor.SetPicker(self.picker)
+        # Initialize() se difiere a showEvent(): llamarlo acá (antes de que el
+        # widget tenga una superficie nativa válida en pantalla) deja el
+        # render window en negro hasta el primer resize manual.
+
+        # Layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.interactor)
+        self.setLayout(layout)
+
+        # Configurar renderer
+        self._setup_renderer()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._interactor_initialized:
+            self.interactor.Initialize()
+            self._interactor_initialized = True
+            self.render_window.Render()
+
+    def _setup_renderer(self):
+        """
+        Configurar parámetros iniciales del renderer
+        """
+        # Color de fondo (gris claro)
+        self.renderer.SetBackground(0.3, 0.3, 0.35)
+
+        # Iluminación
+        self.renderer.ResetCamera()
+
+    def load_mesh(self, model: FootModel):
+        """
+        Cargar y renderizar malla STL
+
+        Args:
+            model: FootModel con vértices y caras
+        """
+        if model.vertices is None or len(model.vertices) == 0:
+            self.logger.error("Modelo sin vértices")
+            return
+
+        # Malla nueva: descartar plano/marcadores/medición de la malla anterior
+        self.reset_measurements()
+        self.enable_picking(False)
+
+        self.current_model = model
+        self.logger.info(f"Cargando malla: {model.num_vertices} vértices, {model.num_triangles} triángulos")
+
+        try:
+            # Crear vtkPolyData
+            poly_data = self._vertices_faces_to_polydata(
+                model.vertices,
+                model.faces
+            )
+
+            # Intentar calcular normales si está disponible
+            if vtkPolyDataNormals is not None:
+                try:
+                    normals_filter = vtkPolyDataNormals()
+                    normals_filter.SetInputData(poly_data)
+                    normals_filter.SetFeatureAngle(45.0)
+                    # SplittingOff(): por defecto vtkPolyDataNormals duplica
+                    # vértices en bordes filosos (para shading plano ahí),
+                    # lo que rompe la correspondencia 1:1 entre model.vertices
+                    # y los puntos de la polydata que necesita
+                    # set_vertex_colors() para pintar por vértice. Un pie
+                    # escaneado no tiene bordes filosos reales, así que
+                    # desactivarlo no cambia el shading visible.
+                    normals_filter.SplittingOff()
+                    normals_filter.Update()
+                    poly_data = normals_filter.GetOutput()
+                    self.logger.debug("Normales calculadas con vtkPolyDataNormals")
+                except Exception as e:
+                    self.logger.warning(f"No se pudieron calcular normales: {e}")
+                    # Continuar sin normales explícitas
+            else:
+                self.logger.debug("vtkPolyDataNormals no disponible - VTK calculará normales automáticamente")
+
+            # Crear actor
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(poly_data)
+
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+
+            # Propiedades visuales
+            prop = actor.GetProperty()
+            prop.SetColor(0.8, 0.8, 0.85)  # Color gris claro (cara frontal)
+            prop.SetSpecular(0.3)
+            prop.SetSpecularPower(20)
+            prop.EdgeVisibilityOff()
+
+            # Color distinto para la cara posterior de cada triángulo: sirve
+            # para notar de un vistazo cuándo se está mirando la malla "del
+            # lado de adentro" (ej. confundir la parte superior con la
+            # inferior en un escaneo de una sola cara, como el de un pie
+            # apoyado sobre una placa). Requiere que las normales estén
+            # orientadas de forma consistente, que es justo lo que calcula
+            # vtkPolyDataNormals más arriba.
+            back_prop = vtkProperty()
+            back_prop.SetColor(0.85, 0.55, 0.4)  # Tono cálido, bien distinguible del gris frontal
+            back_prop.SetSpecular(0.1)
+            actor.SetBackfaceProperty(back_prop)
+
+            # Remover actor anterior si existe
+            if self.mesh_actor is not None:
+                self.renderer.RemoveActor(self.mesh_actor)
+
+            # Agregar nuevo actor
+            self.mesh_actor = actor
+            self.renderer.AddActor(self.mesh_actor)
+
+            # Ajustar cámara
+            self.renderer.ResetCamera()
+
+            # Re-render
+            self.render_window.Render()
+
+            self.logger.info("Malla cargada exitosamente")
+            self.mesh_loaded.emit(model)
+
+        except Exception as e:
+            self.logger.error(f"Error cargando malla: {e}")
+            raise
+
+    def _vertices_faces_to_polydata(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray
+    ) -> vtkPolyData:
+        """
+        Convertir arrays de NumPy a vtkPolyData
+
+        Args:
+            vertices: Array Nx3 de coordenadas de vértices
+            faces: Array Mx3 de índices de triángulos
+
+        Returns:
+            vtkPolyData listo para renderizar
+        """
+        # Crear puntos
+        points = vtkPoints()
+        points.SetNumberOfPoints(len(vertices))
+
+        for i, vertex in enumerate(vertices):
+            points.SetPoint(i, float(vertex[0]), float(vertex[1]), float(vertex[2]))
+
+        # Crear celdas (triángulos)
+        triangles = vtkCellArray()
+
+        for face in faces:
+            triangles.InsertNextCell(3)
+            triangles.InsertCellPoint(int(face[0]))
+            triangles.InsertCellPoint(int(face[1]))
+            triangles.InsertCellPoint(int(face[2]))
+
+        # Crear polydata
+        poly_data = vtkPolyData()
+        poly_data.SetPoints(points)
+        poly_data.SetPolys(triangles)
+
+        return poly_data
+
+    def set_vertex_colors(self, colors: np.ndarray):
+        """
+        Colorear vértices según array RGB (ej. para el mapa de calor de
+        altura). El número de filas debe coincidir con la cantidad de
+        vértices de la malla cargada — `load_mesh()` desactiva el
+        "splitting" de `vtkPolyDataNormals` específicamente para garantizar
+        esta correspondencia 1:1 (sin eso, VTK duplica vértices en bordes
+        filosos y el índice se desalinea).
+
+        Args:
+            colors: Array Nx3 con valores RGB (0-1) o (0-255)
+        """
+        if self.mesh_actor is None or self.current_model is None:
+            self.logger.warning("No hay malla cargada")
+            return
+
+        colors = np.asarray(colors)
+        # Escalar si es necesario
+        if colors.max() > 1:
+            colors = colors.astype(np.uint8)
+        else:
+            colors = (colors * 255).astype(np.uint8)
+
+        self.current_model.vertex_colors = colors
+
+        mapper = self.mesh_actor.GetMapper()
+        poly_data = mapper.GetInput()
+        if poly_data is None:
+            self.logger.error("No hay polydata en mapper")
+            return
+
+        if len(colors) != poly_data.GetNumberOfPoints():
+            self.logger.error(
+                f"set_vertex_colors: {len(colors)} colores no coincide con "
+                f"{poly_data.GetNumberOfPoints()} puntos de la malla"
+            )
+            return
+
+        from vtkmodules.util.numpy_support import numpy_to_vtk
+        from vtkmodules.vtkCommonCore import VTK_UNSIGNED_CHAR
+
+        color_array = numpy_to_vtk(np.ascontiguousarray(colors), deep=True, array_type=VTK_UNSIGNED_CHAR)
+        color_array.SetName("Colors")
+        poly_data.GetPointData().SetScalars(color_array)
+
+        self.render_window.Render()
+        self.logger.info("Colores de vértices aplicados")
+
+    def clear_vertex_colors(self):
+        """Quitar el coloreado por vértice (ej. al apagar el mapa de calor)"""
+        if self.mesh_actor is None or self.current_model is None:
+            return
+
+        mapper = self.mesh_actor.GetMapper()
+        poly_data = mapper.GetInput()
+        if poly_data is not None:
+            poly_data.GetPointData().SetScalars(None)
+
+        self.current_model.vertex_colors = None
+        self.render_window.Render()
+
+    def draw_support_plane(
+        self,
+        plane_center: np.ndarray,
+        plane_normal: np.ndarray,
+        width: float = 100,
+        height: float = 100,
+    ):
+        """
+        Dibujar plano de apoyo
+
+        Args:
+            plane_center: Centro del rectángulo a dibujar (no necesariamente
+                uno de los 3 puntos clickeados: para que el rectángulo cubra
+                bien la huella del pie, el caller debe pasar el centro real
+                de la proyección de la malla sobre el plano, no un punto
+                cualquiera sobre él — ver `compute_plane_footprint`)
+            plane_normal: Normal al plano (vector 3D normalizado)
+            width: Ancho del rectángulo a lo largo de la primera tangente
+            height: Ancho del rectángulo a lo largo de la segunda tangente
+
+        Nota: las tangentes se calculan acá con el mismo criterio
+        determinístico que usa `compute_plane_footprint()` en
+        `measurements.py` (mismo chequeo de `abs(normal[2]) < 0.9`), para que
+        el rectángulo dibujado coincida con el que se usó para medir la
+        huella. Si se cambia el criterio en un lado hay que cambiarlo en
+        el otro.
+        """
+        try:
+            # Crear dos vectores tangentes al plano
+            # Si normal es cercano a [0,0,1], usar [1,0,0] como tangente
+            if abs(plane_normal[2]) < 0.9:
+                tangent1 = np.array([0, 0, 1])
+            else:
+                tangent1 = np.array([1, 0, 0])
+
+            tangent1 = tangent1 - np.dot(tangent1, plane_normal) * plane_normal
+            tangent1 = tangent1 / np.linalg.norm(tangent1)
+
+            tangent2 = np.cross(plane_normal, tangent1)
+            tangent2 = tangent2 / np.linalg.norm(tangent2)
+
+            # Crear 4 esquinas del rectángulo
+            half_width = width / 2
+            half_height = height / 2
+            corners = [
+                plane_center + half_width * tangent1 + half_height * tangent2,
+                plane_center - half_width * tangent1 + half_height * tangent2,
+                plane_center - half_width * tangent1 - half_height * tangent2,
+                plane_center + half_width * tangent1 - half_height * tangent2,
+            ]
+
+            # Crear polydata
+            points = vtkPoints()
+            for i, corner in enumerate(corners):
+                points.InsertNextPoint(float(corner[0]), float(corner[1]), float(corner[2]))
+
+            # Crear quad
+            quad = vtkCellArray()
+            quad.InsertNextCell(4, [0, 1, 2, 3])
+
+            plane_poly = vtkPolyData()
+            plane_poly.SetPoints(points)
+            plane_poly.SetPolys(quad)
+
+            # Crear actor
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(plane_poly)
+
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+
+            # Propiedades: semi-transparente
+            prop = actor.GetProperty()
+            prop.SetColor(0.2, 0.6, 0.8)  # Azul claro
+            prop.SetOpacity(0.3)
+            prop.EdgeVisibilityOn()
+            prop.SetEdgeColor(0.2, 0.4, 0.6)
+            # El plano se dibuja con margen extra respecto a la huella real
+            # (ver compute_plane_footprint), así que puede sobresalir un poco
+            # más allá del borde de la malla — sin esto, un click cerca del
+            # borde del pie podría seleccionar el plano en vez de la malla.
+            actor.PickableOff()
+
+            # Remover plano anterior si existe
+            if self.support_plane_actor is not None:
+                self.renderer.RemoveActor(self.support_plane_actor)
+
+            self.support_plane_actor = actor
+            self.renderer.AddActor(self.support_plane_actor)
+
+            self.render_window.Render()
+            self.logger.info("Plano de apoyo dibujado")
+
+        except Exception as e:
+            self.logger.error(f"Error dibujando plano: {e}")
+
+    def set_plane_visible(self, visible: bool):
+        """
+        Mostrar/ocultar el plano de apoyo sin borrarlo (a diferencia de
+        `reset_measurements`, que sí lo elimina). Útil para dejar de ver el
+        plano momentáneamente sin perder la medición ni tener que
+        redefinirlo.
+        """
+        if self.support_plane_actor is not None:
+            self.support_plane_actor.SetVisibility(1 if visible else 0)
+            self.render_window.Render()
+
+    def enable_picking(self, enabled: bool):
+        """
+        Activar/desactivar la selección de puntos sobre la malla con click izquierdo.
+
+        Se distingue "click" de "arrastre" comparando la posición del mouse
+        entre press y release: si no se movió (dentro de una tolerancia en
+        píxeles), se interpreta como selección de punto y se emite
+        `point_selected`. Si se movió, se asume que fue una rotación de
+        cámara y no se dispara el picking. Así conviven la selección de
+        puntos y la rotación con el mismo botón, sin bloquear la interacción
+        normal de la cámara.
+
+        Implementado con un `eventFilter` de Qt sobre el widget interactor en
+        vez de `AddObserver` de VTK sobre LeftButtonPressEvent/ReleaseEvent:
+        en la versión de VTK usada acá, el método dedicado
+        `vtkGenericRenderWindowInteractor.LeftButtonReleaseEvent()` no siempre
+        dispara el evento observado (comprobado: `InvokeEvent()` directo sí
+        lo hace, el método dedicado no), lo que dejaba el picking sin
+        funcionar nunca. El eventFilter de Qt es la vía confiable.
+
+        Args:
+            enabled: True para activar picking, False para desactivar
+        """
+        if enabled and not self._picking_enabled:
+            self.interactor.installEventFilter(self)
+            self._picking_enabled = True
+        elif not enabled and self._picking_enabled:
+            self.interactor.removeEventFilter(self)
+            self._picking_enabled = False
+            self._press_pos = None
+            self.hide_pick_preview()
+
+    def eventFilter(self, obj, event):
+        if obj is self.interactor:
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._press_pos = event.position()
+            elif event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self._handle_click_release(event)
+            elif event_type == QEvent.Type.MouseMove:
+                self._handle_hover_preview(event.position())
+            elif event_type == QEvent.Type.Leave:
+                self.hide_pick_preview()
+        return super().eventFilter(obj, event)
+
+    def _qt_pos_to_vtk_pixel(self, pos) -> Tuple[int, int]:
+        """
+        Convertir una posición de Qt (local al widget, origen arriba-
+        izquierda) a coordenadas de píxel de dispositivo de VTK (origen
+        abajo-izquierda), como espera `vtkCellPicker.Pick()`.
+        """
+        scale = self.interactor.devicePixelRatioF()
+        x = int(round(pos.x() * scale))
+        y = int(round((self.interactor.height() - pos.y() - 1) * scale))
+        return x, y
+
+    def _handle_click_release(self, event) -> None:
+        CLICK_TOLERANCE_PX = 3
+
+        press_pos = self._press_pos
+        self._press_pos = None
+
+        if press_pos is None or self.mesh_actor is None:
+            return
+
+        release_pos = event.position()
+        dx = release_pos.x() - press_pos.x()
+        dy = release_pos.y() - press_pos.y()
+
+        if (dx * dx + dy * dy) ** 0.5 > CLICK_TOLERANCE_PX:
+            return  # Fue un arrastre (rotación de cámara), no un click
+
+        x, y = self._qt_pos_to_vtk_pixel(release_pos)
+        picked = self.picker.Pick(x, y, 0, self.renderer)
+        if picked and self.picker.GetCellId() != -1:
+            position = np.array(self.picker.GetPickPosition())
+            self.point_selected.emit(position)
+
+    def _handle_hover_preview(self, pos) -> None:
+        """Actualizar la esfera de previsualización según dónde apunta el mouse"""
+        if self.mesh_actor is None:
+            return
+
+        x, y = self._qt_pos_to_vtk_pixel(pos)
+        picked = self.picker.Pick(x, y, 0, self.renderer)
+        if picked and self.picker.GetCellId() != -1:
+            self.show_pick_preview(np.array(self.picker.GetPickPosition()))
+        else:
+            self.hide_pick_preview()
+
+    def show_pick_preview(self, point: np.ndarray):
+        """
+        Mostrar (o reposicionar, si ya existe) la esfera de previsualización
+        en un punto, antes de que el usuario confirme el click. Semi-
+        transparente y de color neutro para distinguirla claramente de un
+        marcador ya confirmado.
+        """
+        if self._preview_sphere_source is None:
+            self._preview_sphere_source = vtkSphereSource()
+            self._preview_sphere_source.SetThetaResolution(16)
+            self._preview_sphere_source.SetPhiResolution(16)
+
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputConnection(self._preview_sphere_source.GetOutputPort())
+
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(1.0, 1.0, 1.0)
+            actor.GetProperty().SetOpacity(0.5)
+            actor.PickableOff()
+
+            self._preview_marker_actor = actor
+            self.renderer.AddActor(actor)
+
+        self._preview_sphere_source.SetRadius(self._default_marker_radius())
+        self._preview_sphere_source.SetCenter(float(point[0]), float(point[1]), float(point[2]))
+        self._preview_marker_actor.SetVisibility(1)
+        self.render_window.Render()
+
+    def hide_pick_preview(self):
+        """Ocultar la esfera de previsualización (el cursor salió de la malla o del canvas)"""
+        if self._preview_marker_actor is not None and self._preview_marker_actor.GetVisibility():
+            self._preview_marker_actor.SetVisibility(0)
+            self.render_window.Render()
+
+    def _default_marker_radius(self) -> float:
+        """Radio de marcador proporcional al tamaño del modelo cargado"""
+        if self.current_model is not None and self.current_model.bounds is not None:
+            x_min, x_max, y_min, y_max, z_min, z_max = self.current_model.bounds
+            diag = max(x_max - x_min, y_max - y_min, z_max - z_min)
+            return max(diag * 0.01, 0.5)
+        return 1.0
+
+    def add_marker(self, point: np.ndarray, color: Tuple[float, float, float] = (1.0, 0.2, 0.2)) -> vtkActor:
+        """
+        Crear un marcador esférico en un punto (feedback visual de picking).
+        No lo asocia a ningún seguimiento por sí solo — el caller decide si
+        va a `plane_marker_actors` (vía `add_plane_marker`) o a los actores
+        de una medición puntual (vía `register_measurement_visuals`).
+
+        Args:
+            point: Punto 3D donde dibujar el marcador
+            color: Color RGB (0-1)
+
+        Returns:
+            El actor VTK creado
+        """
+        sphere = vtkSphereSource()
+        sphere.SetCenter(float(point[0]), float(point[1]), float(point[2]))
+        sphere.SetRadius(self._default_marker_radius())
+        sphere.SetThetaResolution(16)
+        sphere.SetPhiResolution(16)
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(sphere.GetOutputPort())
+
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        # Que el propio marcador no se pueda picker: si no, un click cerca de
+        # un punto ya marcado podría seleccionar la esfera del marcador en
+        # vez de la malla real de abajo.
+        actor.PickableOff()
+
+        self.renderer.AddActor(actor)
+        self.render_window.Render()
+        return actor
+
+    def add_plane_marker(self, point: np.ndarray) -> vtkActor:
+        """Marcador de uno de los 3 puntos usados para definir el plano de apoyo"""
+        actor = self.add_marker(point, color=(0.2, 0.8, 1.0))
+        self.plane_marker_actors.append(actor)
+        return actor
+
+    def clear_plane_markers(self):
+        """Quitar los marcadores de los puntos que definen el plano de apoyo"""
+        for actor in self.plane_marker_actors:
+            self.renderer.RemoveActor(actor)
+        self.plane_marker_actors = []
+        self.render_window.Render()
+
+    def remove_last_plane_marker(self):
+        """Quitar solo el último marcador de punto del plano agregado (para deshacer un click)"""
+        if self.plane_marker_actors:
+            actor = self.plane_marker_actors.pop()
+            self.renderer.RemoveActor(actor)
+            self.render_window.Render()
+
+    def register_measurement_visuals(self, measurement_id: int, actors: List[vtkActor]):
+        """
+        Asociar uno o más actores (marcador(es), línea) a una medición, para
+        poder borrarlos selectivamente más adelante con `remove_measurement`.
+
+        Args:
+            measurement_id: Id de la Measurement (ver `Measurement.id`)
+            actors: Actores VTK ya agregados al renderer (creados con
+                    `add_marker`/`add_measurement_line`)
+        """
+        self.measurement_visuals.setdefault(measurement_id, []).extend(actors)
+
+    def remove_actors(self, actors: List[vtkActor]):
+        """
+        Quitar actores sueltos del canvas (ej. marcadores de una medición de
+        2 clicks cancelada después del primero, que todavía no llegó a
+        registrarse con `register_measurement_visuals`).
+        """
+        for actor in actors:
+            self.renderer.RemoveActor(actor)
+        if actors:
+            self.render_window.Render()
+
+    def remove_measurement(self, measurement_id: int):
+        """Quitar del canvas todos los actores asociados a una medición puntual"""
+        actors = self.measurement_visuals.pop(measurement_id, [])
+        for actor in actors:
+            self.renderer.RemoveActor(actor)
+        if actors:
+            self.render_window.Render()
+
+    def add_measurement_line(
+        self,
+        point_a: np.ndarray,
+        point_b: np.ndarray,
+        color: Tuple[float, float, float] = (1.0, 0.8, 0.0),
+    ) -> vtkActor:
+        """
+        Crear una línea entre dos puntos para visualizar una medición (altura
+        de arco o distancia en el plano). No la asocia a ningún seguimiento
+        por sí sola — usar `register_measurement_visuals` para poder
+        borrarla junto con sus marcadores más adelante.
+
+        Args:
+            point_a: Primer extremo de la línea
+            point_b: Segundo extremo de la línea
+            color: Color RGB (0-1) de la línea
+
+        Returns:
+            El actor VTK creado
+        """
+        line = vtkLineSource()
+        line.SetPoint1(*[float(c) for c in point_a])
+        line.SetPoint2(*[float(c) for c in point_b])
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(line.GetOutputPort())
+
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetLineWidth(3)
+        actor.PickableOff()
+
+        self.renderer.AddActor(actor)
+        self.render_window.Render()
+        return actor
+
+    def show_measurement_text(self, text: str):
+        """
+        Mostrar texto superpuesto en la esquina del canvas (ej. valor de medición)
+
+        Args:
+            text: Texto a mostrar
+        """
+        if self.measurement_text_actor is None:
+            self.measurement_text_actor = vtkTextActor()
+            text_prop = self.measurement_text_actor.GetTextProperty()
+            text_prop.SetFontSize(20)
+            text_prop.SetColor(1.0, 1.0, 1.0)
+            text_prop.SetBold(True)
+            self.measurement_text_actor.SetPosition(10, 10)
+            # AddActor2D fue reemplazado por el AddActor genérico en VTK 9.7+
+            # (que acepta vtkActor2D igual que vtkActor); AddActor2D directamente
+            # no existe en vtkRenderer en esta versión instalada.
+            self.renderer.AddActor(self.measurement_text_actor)
+
+        self.measurement_text_actor.SetInput(text)
+        self.render_window.Render()
+
+    def clear_measurement_text(self):
+        """Quitar el texto de medición superpuesto"""
+        if self.measurement_text_actor is not None:
+            self.renderer.RemoveActor(self.measurement_text_actor)
+            self.measurement_text_actor = None
+            self.render_window.Render()
+
+    def reset_measurements(self):
+        """Limpiar plano de apoyo, marcadores, líneas y texto de medición del canvas"""
+        self.clear_plane_markers()
+        if self.support_plane_actor is not None:
+            self.renderer.RemoveActor(self.support_plane_actor)
+            self.support_plane_actor = None
+        for actors in self.measurement_visuals.values():
+            for actor in actors:
+                self.renderer.RemoveActor(actor)
+        self.measurement_visuals = {}
+        self.clear_measurement_text()
+        self.render_window.Render()
+
+    def show_axes(self, show: bool = True):
+        """
+        Mostrar/ocultar ejes de coordenadas
+
+        Args:
+            show: True para mostrar, False para ocultar
+        """
+        try:
+            if show:
+                if self.axes_actor is None:
+                    self.axes_actor = vtkAxesActor()
+                    self.axes_actor.PickableOff()
+                    # Escalar ejes
+                    if self.current_model and self.current_model.bounds:
+                        x_min, x_max, y_min, y_max, z_min, z_max = self.current_model.bounds
+                        scale = (max(x_max - x_min, y_max - y_min, z_max - z_min)) / 3
+                        self.axes_actor.SetTotalLength(scale, scale, scale)
+
+                self.renderer.AddActor(self.axes_actor)
+            else:
+                if self.axes_actor is not None:
+                    self.renderer.RemoveActor(self.axes_actor)
+
+            self.render_window.Render()
+        except Exception as e:
+            self.logger.error(f"Error al mostrar ejes: {e}")
+
+    def _set_camera_view(self, position: np.ndarray, focal_point: np.ndarray, view_up: np.ndarray):
+        """
+        Establecer posición de cámara
+
+        Args:
+            position: Posición de la cámara
+            focal_point: Punto focal
+            view_up: Vector "arriba" de la vista
+        """
+        if self.current_model is None:
+            return
+
+        camera = self.renderer.GetActiveCamera()
+        camera.SetPosition(position[0], position[1], position[2])
+        camera.SetFocalPoint(focal_point[0], focal_point[1], focal_point[2])
+        camera.SetViewUp(view_up[0], view_up[1], view_up[2])
+        # ResetCamera() DESPUÉS de fijar dirección/foco: ajusta la distancia a
+        # lo largo de esa dirección para que el bounding box completo entre en
+        # cuadro, en vez de dejar la distancia fija que pasó el caller (que
+        # puede quedar muy cerca o muy lejos según el tamaño real del modelo).
+        # Llamarlo ANTES (como estaba) ajusta el clipping para la cámara
+        # VIEJA y además el picking, que depende de ese rango, falla en
+        # silencio aunque el render se vea bien.
+        self.renderer.ResetCamera()
+        self.renderer.ResetCameraClippingRange()
+        self.render_window.Render()
+
+    def reset_camera(self):
+        """Resetear cámara a vista inicial"""
+        self.renderer.ResetCamera()
+        self.render_window.Render()
+
+    def capture_screenshot(self, filepath: str):
+        """
+        Capturar la vista actual del canvas (malla + plano + marcadores +
+        mediciones tal como se ven en pantalla) y guardarla como PNG. Se usa
+        para incluir una imagen del pie en el informe PDF.
+
+        Args:
+            filepath: Ruta del archivo .png a escribir
+        """
+        w2i = vtkWindowToImageFilter()
+        w2i.SetInput(self.render_window)
+        w2i.SetInputBufferTypeToRGB()
+        w2i.ReadFrontBufferOff()
+        w2i.Update()
+
+        writer = vtkPNGWriter()
+        writer.SetFileName(filepath)
+        writer.SetInputConnection(w2i.GetOutputPort())
+        writer.Write()
+        self.logger.info(f"Captura de pantalla guardada: {filepath}")
+
+    def set_view_anterior(self):
+        """Vista anterior (frontal)"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        position = center + np.array([0, 200, 0])
+        focal_point = center
+        view_up = np.array([0, 0, 1])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def set_view_posterior(self):
+        """Vista posterior"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        position = center + np.array([0, -200, 0])
+        focal_point = center
+        view_up = np.array([0, 0, 1])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def set_view_medial(self):
+        """Vista medial (desde adentro)"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        position = center + np.array([200, 0, 0])
+        focal_point = center
+        view_up = np.array([0, 0, 1])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def set_view_lateral(self):
+        """Vista lateral (desde afuera)"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        position = center + np.array([-200, 0, 0])
+        focal_point = center
+        view_up = np.array([0, 0, 1])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def set_view_plantar(self):
+        """Vista plantar (desde abajo)"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        position = center + np.array([0, 0, -200])
+        focal_point = center
+        view_up = np.array([0, 1, 0])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def set_view_dorsal(self):
+        """Vista dorsal (desde arriba)"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        position = center + np.array([0, 0, 200])
+        focal_point = center
+        view_up = np.array([0, 1, 0])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def set_view_isometric(self):
+        """Vista isométrica"""
+        if self.current_model is None:
+            return
+
+        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
+        distance = 150
+        position = center + np.array([distance, distance, distance])
+        focal_point = center
+        view_up = np.array([0, 0, 1])
+        self._set_camera_view(position, focal_point, view_up)
+
+    def clear(self):
+        """Limpiar canvas"""
+        if self.mesh_actor is not None:
+            self.renderer.RemoveActor(self.mesh_actor)
+            self.mesh_actor = None
+
+        self.reset_measurements()
+        self.enable_picking(False)
+
+        self.current_model = None
+        self.render_window.Render()
+        self.logger.info("Canvas limpiado")

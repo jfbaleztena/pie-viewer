@@ -1,0 +1,251 @@
+================================================================================
+  SISTEMA DE VISUALIZACIÓN DE PIES 3D - MVP (Sprint 1)
+  Versión 0.1.0
+================================================================================
+
+📍 UBICACIÓN: C:\Users\juanf\OneDrive\Escritorio\FM Ortopedia\pie-viewer
+
+================================================================================
+  INSTALACIÓN RÁPIDA (5 MINUTOS)
+================================================================================
+
+1. ABRIR TERMINAL EN WINDOWS
+   - Presionar: Windows + R
+   - Escribir: cmd
+   - Presionar: Enter
+
+2. NAVEGAR AL DIRECTORIO
+   Copiar y pegar en la terminal:
+   
+   cd "C:\Users\juanf\OneDrive\Escritorio\FM Ortopedia\pie-viewer"
+
+3. CREAR ENTORNO VIRTUAL
+   
+   python -m venv venv
+
+4. ACTIVAR ENTORNO
+   
+   .\venv\Scripts\activate
+   
+   (Deberías ver "(venv)" al inicio de la línea)
+
+5. INSTALAR DEPENDENCIAS
+   
+   pip install -r requirements.txt
+   
+   (Tardará 2-3 minutos)
+
+6. EJECUTAR APLICACIÓN
+   
+   python -m src.main
+   
+   ¡La ventana debería aparecer en segundos!
+
+================================================================================
+  USO DE LA APLICACIÓN
+================================================================================
+
+CARGAR UN ARCHIVO STL:
+  1. Menú → Archivo → Abrir STL
+  2. O presionar: Ctrl+O
+  3. Seleccionar un archivo .stl de tu pie
+
+VER DIFERENTES VISTAS:
+  - Panel derecho: 7 botones grandes con vistas estándar
+  - Anterior (Punta), Posterior (Talón), Dorsal (Arriba), Plantar (Abajo)
+  - Medial (Interno), Lateral (Externo), Isométrica
+
+INTERACTUAR CON EL MODELO:
+  - ROTAR: Click derecho + arrastrar el mouse
+  - ZOOM: Rueda del mouse (arriba/abajo)
+  - PAN: Click central + arrastrar el mouse
+
+INFORMACIÓN DEL MODELO:
+  - Barra inferior: Número de vértices y triángulos cargados
+  - Está validado automáticamente
+
+================================================================================
+  VERIFICAR QUE TODO FUNCIONA
+================================================================================
+
+EJECUTAR LOS TESTS:
+  
+  python -m pytest tests/ -v
+  
+  Resultado esperado: 24/24 tests passing ✅
+
+ESTO VERIFICA QUE:
+  ✅ Carga de archivos STL (ASCII y Binary)
+  ✅ Validación de geometría
+  ✅ Renderizado 3D
+  ✅ Interacción con la malla
+  ✅ Todas las vistas funcionan
+
+================================================================================
+  DOCUMENTACIÓN INCLUIDA
+================================================================================
+
+📖 QUICK_START.md
+   Inicio rápido en 5 minutos
+
+📖 RUN_APPLICATION.md
+   Guía completa de uso y troubleshooting
+
+📖 README.md
+   Descripción general del proyecto
+
+📖 INSTALACION.md
+   Pasos detallados de instalación
+
+📖 requirements.txt
+   Dependencias del proyecto (para instalación)
+
+================================================================================
+  CARACTERÍSTICAS IMPLEMENTADAS (SPRINT 1)
+================================================================================
+
+✅ Parser STL completo (ASCII y Binary)
+✅ Validación robusta de geometría
+✅ Renderizado 3D con VTK
+✅ 7 vistas predefinidas (Ortopédicas)
+✅ Interacción: Rotación, Zoom, Pan
+✅ Información en tiempo real (vértices, triángulos)
+✅ Manejo completo de errores
+✅ Logging detallado
+✅ Suite de tests comprehensive (24 tests)
+✅ Código limpio y documentado
+
+================================================================================
+  PRÓXIMAS FASES
+================================================================================
+
+SPRINT 2:
+  - Plano de apoyo personalizado (usuario selecciona 3 puntos)
+  - Mapa de colores por altura/distancia
+
+SPRINT 3:
+  - Mediciones (distancia, ángulo)
+  - Anotaciones en puntos
+  - Propiedades del modelo
+
+SPRINT 4:
+  - Comparación izquierdo/derecho
+  - Reportes
+  - Almacenamiento de pacientes
+
+================================================================================
+  TROUBLESHOOTING
+================================================================================
+
+PROBLEMA: "ModuleNotFoundError: No module named 'PyQt6'"
+SOLUCIÓN: pip install PyQt6==6.7.1
+
+PROBLEMA: "ModuleNotFoundError: No module named 'vtkmodules'"
+SOLUCIÓN: pip install VTK==9.3.0
+
+PROBLEMA: La ventana no aparece
+SOLUCIÓN:
+  1. Verifica que (venv) esté visible en la terminal
+  2. Intenta de nuevo: python -m src.main
+  3. Si aún no funciona, reinstala: pip install -r requirements.txt
+
+PROBLEMA: "Error: Archivo no encontrado"
+SOLUCIÓN: Verifica que el archivo .stl exista y tenga la extensión correcta
+
+PROBLEMA: Los tests fallan
+SOLUCIÓN: Asegúrate de estar en el directorio pie-viewer y que el venv esté activado
+
+================================================================================
+  ESTRUCTURA DEL PROYECTO
+================================================================================
+
+pie-viewer/
+│
+├── src/                              # Código fuente
+│   ├── main.py                       # PUNTO DE ENTRADA (ejecuta esto)
+│   ├── core/
+│   │   └── mesh_loader.py            # Carga y valida STL
+│   ├── ui/
+│   │   ├── main_window.py            # Ventana principal
+│   │   └── widgets/
+│   │       └── view_3d.py            # Canvas VTK (renderizado 3D)
+│   ├── models/
+│   │   └── foot_model.py             # Estructura de datos
+│   └── utils/
+│       ├── constants.py              # Configuración global
+│       └── logger.py                 # Sistema de logging
+│
+├── tests/                            # Suite de tests
+│   ├── test_mesh_loader.py           # 13 tests unitarios
+│   └── test_integration.py           # 11 tests de integración
+│
+├── requirements.txt                  # Dependencias (pip install -r)
+├── README.md                         # Descripción general
+├── QUICK_START.md                    # Guía rápida
+├── RUN_APPLICATION.md                # Guía de uso completa
+└── INSTALACION.md                    # Pasos de instalación
+
+================================================================================
+  COMANDOS ÚTILES
+================================================================================
+
+# Activar el entorno virtual
+.\venv\Scripts\activate
+
+# Desactivar el entorno virtual
+deactivate
+
+# Ejecutar la aplicación
+python -m src.main
+
+# Ejecutar todos los tests
+python -m pytest tests/ -v
+
+# Ejecutar solo tests de mesh_loader
+python -m pytest tests/test_mesh_loader.py -v
+
+# Ejecutar solo tests de integración
+python -m pytest tests/test_integration.py -v
+
+# Ver cobertura de tests
+python -m pytest tests/ --cov=src
+
+# Salir de la aplicación
+Ctrl+Q o cerrar la ventana
+
+================================================================================
+  ESPECIFICACIONES TÉCNICAS
+================================================================================
+
+Python:        3.9+
+PyQt6:         6.7.1 (UI Framework)
+VTK:           9.3.0 (3D Rendering)
+NumPy:         1.24.3 (Matemática)
+SciPy:         1.11.3 (Geometría)
+pytest:        7.4.3 (Testing)
+
+Tamaño máximo de malla: 2 millones de triángulos
+Tolerancia geométrica: 1e-10
+
+================================================================================
+  CONTACTO Y SOPORTE
+================================================================================
+
+Para problemas o preguntas:
+1. Revisar la documentación incluida
+2. Ejecutar los tests: python -m pytest tests/ -v
+3. Revisar los logs si hay errores
+
+Estado: ✅ LISTO PARA PRODUCCIÓN (MVP)
+Versión: 0.1.0
+Fecha: 31 de Agosto, 2026
+
+================================================================================
+
+🚀 ¡LISTO PARA COMENZAR!
+
+Próximo paso: Ejecutar los 6 pasos de instalación arriba y luego:
+
+python -m src.main
+
+================================================================================
