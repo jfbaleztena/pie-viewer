@@ -62,10 +62,10 @@ Git inicializado (`.git` no existe), así que no se generaron commits.
 15. **Botón "Mostrar plano"**: oculta/muestra el plano de apoyo sin borrarlo
     (`actor.SetVisibility()`) — el plano y las mediciones que dependen de él
     siguen intactos, solo cambia si se dibuja o no.
-16. **Color distinto para la cara posterior de la malla** (`SetBackfaceProperty`):
-    ayuda a notar cuándo se está mirando la malla "del lado de adentro" en
-    vez de confundir la parte superior con la inferior — útil en un escaneo
-    de una sola cara como el de un pie apoyado sobre una placa de vidrio.
+16. ~~Color distinto para la cara posterior de la malla~~ — se probó pero se
+    revirtió al mismo color que la cara frontal; ver bug #10 (no es
+    confiable con escaneos OBJ reales no-manifold, terminaba marcando la
+    planta entera como "cara trasera").
 17. **Previsualización al pickear**: mientras un modo de selección está
     activo (plano/altura/distancia), una esfera semi-transparente sigue al
     cursor mostrando dónde caería el click antes de confirmarlo.
@@ -91,6 +91,18 @@ Git inicializado (`.git` no existe), así que no se generaron commits.
     existente).
 23. **Toggle de ejes de coordenadas** (botón "Ejes"): reactiva `show_axes()`,
     otro método de Sprint 1 que existía sin conectar a ningún botón.
+24. **Importar y ver la textura de un OBJ** (botón "Mostrar textura"): si el
+    `.obj` trae coordenadas UV, `.mtl` e imagen (`map_Kd`) válidos,
+    `MeshLoader` los parsea y arma un `TextureData` separado (vértices/UVs/
+    caras propios, duplicando vértices en las costuras UV como exige el
+    formato) sin tocar `FootModel.vertices/faces`, que sigue siendo la malla
+    de posiciones "cruda" que usan todas las mediciones. El botón intercambia
+    el polydata del mismo `mesh_actor` entre la versión plana (mapa de
+    calor/gris) y la texturada; es mutuamente excluyente con el mapa de
+    calor. Si el archivo no trae textura completa, el botón queda
+    deshabilitado. Pensado como paso previo a poder tomar medidas sobre una
+    marca de tinta hecha en el pie antes de escanear (ver bug #10, que
+    apareció al construir esta funcionalidad).
 
 ## Archivos nuevos
 
@@ -163,11 +175,34 @@ Git inicializado (`.git` no existe), así que no se generaron commits.
   (se reusan tanto al medir en vivo como al restaurar un proyecto cargado).
 - [src/models/foot_model.py](src/models/foot_model.py) — `Measurement` ahora
   tiene un campo `id` autogenerado (contador global), necesario para poder
-  asociar y borrar sus actores visuales de forma individual.
+  asociar y borrar sus actores visuales de forma individual. Nuevo
+  `TextureData` (vértices/UVs/caras propios + ruta de imagen) y campo
+  `texture: Optional[TextureData]` en `FootModel`, deliberadamente separado
+  de `vertices`/`faces` (ver "Decisiones de diseño").
+- [src/core/mesh_loader.py](src/core/mesh_loader.py) — `_load_obj()` ahora
+  también parsea `vt` y `mtllib`/`usemtl`; nuevo `_resolve_obj_texture()`
+  (resuelve `.mtl` → `map_Kd` → imagen, relativos a la carpeta del `.obj`,
+  devolviendo `None` ante cualquier pieza faltante en vez de fallar: la
+  textura es opcional). Política "todo o nada": si *alguna* cara no trae
+  `vt`, no se arma textura para toda la malla. `_parse_obj_face_index()` se
+  reemplazó por `_parse_obj_face_token()` (separa índice de posición e
+  índice de UV por vértice de cara) y `_parse_obj_index()` (genérico,
+  1-based/negativo → 0-based).
+- [src/ui/widgets/view_3d.py](src/ui/widgets/view_3d.py) — `has_texture()`,
+  `set_texture_visible()` y `_build_texture_polydata()`: arma un polydata
+  aparte (posiciones/caras propias de `TextureData`, con `TCoords`) y lo
+  intercambia con el polydata plano en el mismo `mesh_actor` — mismo patrón
+  que ya usaba el mapa de calor para no duplicar actores. `numpy_to_vtk`
+  ahora se importa una sola vez a nivel de módulo (antes se reimportaba
+  localmente en `set_vertex_colors()`).
 - [tests/test_mesh_loader.py](tests/test_mesh_loader.py) — clase
   `TestMeshLoaderOBJ` (8 tests: triángulo simple, vértices compartidos,
   normales/texturas ignoradas, formato `v//vn`, triangulación de quads,
-  bounds, errores de formato).
+  bounds, errores de formato). Nueva clase `TestMeshLoaderOBJTexture`
+  (7 tests, con OBJ+MTL+PNG sintéticos en un directorio temporal: textura
+  completa con costura UV deduplicada, sin `vt`, `.mtl` faltante, imagen
+  faltante, `.mtl` sin `map_Kd`, sin `mtllib`, cobertura parcial de `vt`
+  entre caras).
 
 ## Bugs encontrados y corregidos en pruebas manuales
 
@@ -420,6 +455,50 @@ existentes de Sprint 1 solo testean `MeshLoader`/`FootModel`, no
 `VTK3DView`), por eso pasaron desapercibidos hasta la prueba manual de la
 app real con mouse de verdad.
 
+### 10. Color de cara posterior + normales sin orientación global: la planta se veía color piel en vez de gris (y la textura salía "parchada")
+
+Al implementar la textura (ver funcionalidad de importar OBJ texturado más
+abajo), la vista plantar del pie real (`pie_mio_texturado.obj`) se veía
+naranja/piel en vez del gris esperado, **incluso con la textura
+desactivada** — contradiciendo lo que decían las propiedades del actor
+(`prop.GetColor()` devolvía correctamente `(0.8, 0.8, 0.85)`, gris, y
+`actor.GetTexture()` era `None`).
+
+Diagnóstico: comparando capturas de la vista dorsal (correcta, gris) contra
+la plantar (incorrecta, color piel) del mismo modelo, quedó claro que el
+color "malo" era exactamente el tono cálido configurado en
+`SetBackfaceProperty()` (bug pre-existente desde la funcionalidad 16,
+"color distinto para cara posterior") — es decir, VTK estaba clasificando
+**toda la superficie plantar** como "cara trasera". La causa raíz:
+`vtkPolyDataNormals` con `ConsistencyOn` (que ya estaba activo por default)
+solo garantiza que las normales sean consistentes *entre sí* dentro de una
+misma malla, pero no determina cuál sentido es "hacia afuera" en un
+escaneo real, abierto (sin cerrar en el tobillo) y no-manifold — eso
+depende del orden de vértices (`winding`) con el que el archivo de origen
+escribió cada cara, y el exportador OBJ de CrealityScan usa una convención
+distinta a su exportador STL para este mismo escaneo. Se probó
+`AutoOrientNormalsOn()` (pensado para detectar el sentido correcto
+automáticamente) pero no tuvo efecto: ese modo requiere una superficie
+cerrada y manifold, que este escaneo no es (confirmado que tiene 2
+componentes conexas separadas por `vtkPolyDataNormals`, ver `foot_model` /
+verificación con `scipy.sparse.csgraph.connected_components`).
+
+Como corregir el `winding` de origen por componente conexa es una solución
+compleja y fragil para datos de escaneo reales, se optó por **eliminar la
+distinción de color entre cara frontal y trasera** (mismo `vtkProperty`
+para ambas en `load_mesh()`): la funcionalidad de "avisar cuándo se mira la
+malla del lado de adentro" dejó de ser confiable con mallas OBJ reales
+no-manifold, y en este caso concreto marcaba como "cara trasera" justo la
+zona más importante para medir (la planta). Con colores iguales en ambas
+caras, el resultado es predecible sin importar el winding del archivo.
+
+Este mismo bug explicaba además un problema aparte que parecía ser de la
+textura: al activarla, la planta se veía con parches naranjas irregulares
+superpuestos a la imagen real (parecía "manchada"). No era un error de
+mapeo UV — era el mismo conflicto de color de cara trasera compitiendo con
+la textura en las mismas zonas. Al unificar el color de ambas caras, los
+parches desaparecieron y la textura se ve nítida.
+
 ## Decisiones de diseño tomadas (y por qué)
 
 - **STL vs OBJ para probar la app**: se recibieron dos archivos de prueba,
@@ -587,11 +666,12 @@ en vez de buscar el extremo sobre la malla completa sin filtrar.
 
 ## Tests
 
-65/65 tests pasan (22 preexistentes de Sprint 1 en `test_integration.py` y
-las clases no-OBJ de `test_mesh_loader.py` + 43 nuevos de este sprint: 25 en
+72/72 tests pasan (22 preexistentes de Sprint 1 en `test_integration.py` y
+las clases no-OBJ de `test_mesh_loader.py` + 50 nuevos de este sprint: 25 en
 `test_measurements.py` — plano, altura, distancia en el plano, footprint del
 plano, mapa de alturas y su gradiente de color —, 8 en `TestMeshLoaderOBJ`,
-7 en `test_report_export.py` y 4 en `test_project_io.py`).
+7 en `TestMeshLoaderOBJTexture`, 7 en `test_report_export.py` y 4 en
+`test_project_io.py`).
 
 ```bash
 cd pie-viewer
@@ -602,6 +682,13 @@ También se validó manualmente contra `Pie_random.stl` real (28.014 vértices
 tras deduplicación, 54.671 triángulos): carga, cálculo de plano y distancia
 punto-plano dan valores geométricamente consistentes (~50 mm en el punto más
 alto respecto a un plano de base de prueba).
+
+Y contra el archivo real texturado del usuario (`pie_mio_texturado.obj` +
+`.mtl` + `.png`, 28.014 vértices / 164.013 coordenadas UV / 54.671
+triángulos): textura visible y nítida en la vista plantar tras el fix del
+bug #10, picking sigue funcionando con la textura activa, y volver al modo
+sin textura restaura el polydata plano (mismo número de puntos que
+`model.num_vertices`).
 
 Las últimas 6 funcionalidades (avisos de escala, deshacer, confirmación al
 cerrar, nombres editables, atajos de teclado, toggle de ejes) son de UI pura
@@ -655,5 +742,16 @@ permanentes, siguiendo el mismo criterio que el resto de la UI en este sprint.
   afecta el cálculo de altura porque se usa valor absoluto, pero si a futuro
   se necesita el signo (por ejemplo para colorear por encima/debajo del
   plano) habría que fijar una convención.
+- `pie_mio_texturado.obj` tiene un pequeño fragmento de malla desconectado
+  del cuerpo principal cerca del tobillo (~2.049 de 28.014 vértices,
+  confirmado con `scipy.sparse.csgraph.connected_components` — mismo tipo de
+  fragmento que ya había aparecido con el `.asc` de nube de puntos, ver
+  sección "Intentado y revertido" más arriba). Se ve como una cuña oscura
+  junto al borde superior del pie tanto con textura como sin ella; no
+  interfiere con las mediciones actuales (plano, altura, distancias) porque
+  ninguna depende de que la malla sea una sola pieza, pero sí sería relevante
+  si en el futuro se retoma la detección automática del talón u otro punto
+  por extremo geométrico — habría que filtrar al componente conexo más
+  grande antes de buscar el extremo.
 - Strings de UI hardcodeados en español, sin capa de i18n (igual que en
   Sprint 1).

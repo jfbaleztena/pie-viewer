@@ -10,6 +10,25 @@ _measurement_id_counter = itertools.count(1)
 
 
 @dataclass
+class TextureData:
+    """
+    Datos para renderizar la malla con su textura (foto del pie envuelta
+    sobre la superficie), separados de FootModel.vertices/faces.
+
+    Por qué separados: las coordenadas UV de un OBJ están indexadas aparte
+    de las posiciones (un mismo vértice de posición puede necesitar varias
+    UV distintas en las costuras del "unwrap" de textura), así que la malla
+    de render con textura tiene más vértices que la malla de posiciones
+    pura — no sirven para cálculos de medición (plano, alturas, distancias),
+    que siguen usando exclusivamente FootModel.vertices/faces.
+    """
+    vertices: np.ndarray  # Nx3, posiciones (con duplicados en costuras UV)
+    uvs: np.ndarray       # Nx2, coordenada UV de cada vértice de `vertices`
+    faces: np.ndarray     # Mx3, índices de triángulos sobre `vertices`
+    image_path: str       # ruta absoluta a la imagen de textura (map_Kd)
+
+
+@dataclass
 class FootModel:
     """
     Representa un modelo 3D de pie cargado desde STL
@@ -25,6 +44,7 @@ class FootModel:
     num_triangles: int = 0
     num_vertices: int = 0
     vertex_colors: Optional[np.ndarray] = None
+    texture: Optional[TextureData] = None
     is_valid: bool = True
     validation_warnings: list = field(default_factory=list)
 

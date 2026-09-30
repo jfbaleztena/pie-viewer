@@ -383,6 +383,140 @@ f 1 2 3
             Path(filepath).unlink()
 
 
+class TestMeshLoaderOBJTexture:
+    """Tests para la carga de textura (UV + .mtl + imagen) de archivos OBJ"""
+
+    @staticmethod
+    def _write_square_obj(tmp_path, mtllib_line="mtllib test.mtl\n"):
+        """Cuadrado de 2 triángulos con UV, comparte (v, vt) en 2 esquinas"""
+        obj_path = tmp_path / "square.obj"
+        obj_path.write_text(
+            mtllib_line +
+            "v 0 0 0\n"
+            "v 1 0 0\n"
+            "v 1 1 0\n"
+            "v 0 1 0\n"
+            "vt 0 0\n"
+            "vt 1 0\n"
+            "vt 1 1\n"
+            "vt 0 1\n"
+            "f 1/1 2/2 3/3\n"
+            "f 1/1 3/3 4/4\n"
+        )
+        return obj_path
+
+    @staticmethod
+    def _write_mtl(tmp_path, image_name="test.png", filename="test.mtl"):
+        mtl_path = tmp_path / filename
+        mtl_path.write_text(f"newmtl material0\nmap_Kd {image_name}\n")
+        return mtl_path
+
+    @staticmethod
+    def _write_png(tmp_path, name="test.png"):
+        from PIL import Image
+        img = Image.new('RGB', (4, 4), color=(200, 100, 50))
+        img_path = tmp_path / name
+        img.save(img_path)
+        return img_path
+
+    def test_obj_without_vt_has_no_texture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = tmp_path / "plain.obj"
+            obj_path.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+
+            model = MeshLoader().load(str(obj_path))
+            assert model.texture is None
+
+    def test_obj_with_full_texture_loads_correctly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = self._write_square_obj(tmp_path)
+            self._write_mtl(tmp_path)
+            self._write_png(tmp_path)
+
+            model = MeshLoader().load(str(obj_path))
+
+            assert model.texture is not None
+            assert model.num_vertices == 4
+            assert model.num_triangles == 2
+            # 6 "corners" entre las 2 caras, pero 2 pares (v, vt) se repiten
+            # exactamente -> se deduplican a 4 vertices de textura
+            assert len(model.texture.vertices) == 4
+            assert len(model.texture.faces) == 2
+            assert model.texture.uvs.shape == (4, 2)
+            assert Path(model.texture.image_path).exists()
+            assert Path(model.texture.image_path).name == "test.png"
+
+    def test_obj_missing_mtl_has_no_texture_but_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = self._write_square_obj(tmp_path, mtllib_line="mtllib no_existe.mtl\n")
+            # No se escribe el .mtl a propósito
+
+            model = MeshLoader().load(str(obj_path))
+
+            assert model.texture is None
+            assert model.num_vertices == 4  # la geometria igual carga bien
+
+    def test_obj_missing_image_has_no_texture_but_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = self._write_square_obj(tmp_path)
+            self._write_mtl(tmp_path, image_name="no_existe.png")
+            # No se escribe la imagen a propósito
+
+            model = MeshLoader().load(str(obj_path))
+
+            assert model.texture is None
+            assert model.num_vertices == 4
+
+    def test_obj_mtl_without_map_kd_has_no_texture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = self._write_square_obj(tmp_path)
+            mtl_path = tmp_path / "test.mtl"
+            mtl_path.write_text("newmtl material0\nKd 1.0 1.0 1.0\n")  # sin map_Kd
+
+            model = MeshLoader().load(str(obj_path))
+
+            assert model.texture is None
+
+    def test_obj_without_mtllib_has_no_texture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = tmp_path / "square.obj"
+            obj_path.write_text(
+                "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
+                "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n"
+                "f 1/1 2/2 3/3\nf 1/1 3/3 4/4\n"
+            )
+            self._write_png(tmp_path)
+
+            model = MeshLoader().load(str(obj_path))
+
+            assert model.texture is None
+
+    def test_obj_partial_vt_coverage_has_no_texture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = tmp_path / "mixed.obj"
+            obj_path.write_text(
+                "mtllib test.mtl\n"
+                "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
+                "vt 0 0\nvt 1 0\nvt 1 1\n"
+                "f 1/1 2/2 3/3\n"
+                "f 1 3 4\n"  # esta cara no trae vt
+            )
+            self._write_mtl(tmp_path)
+            self._write_png(tmp_path)
+
+            model = MeshLoader().load(str(obj_path))
+
+            assert model.texture is None
+            assert model.num_triangles == 2  # la geometria igual carga bien
+
+
 class TestMeshLoaderIntegration:
     """Tests de integración"""
 

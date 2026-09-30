@@ -11,6 +11,7 @@ Responsabilidades:
 """
 
 import numpy as np
+from pathlib import Path
 from typing import Optional, Tuple, List
 import logging
 
@@ -30,13 +31,14 @@ from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
 from vtkmodules.vtkRenderingCore import (
-    vtkPolyDataMapper, vtkProperty, vtkCellPicker, vtkTextActor, vtkWindowToImageFilter
+    vtkPolyDataMapper, vtkProperty, vtkCellPicker, vtkTextActor, vtkWindowToImageFilter, vtkTexture
 )
 from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
 from vtkmodules.vtkFiltersSources import vtkSphereSource, vtkLineSource
-from vtkmodules.vtkIOImage import vtkPNGWriter
+from vtkmodules.vtkIOImage import vtkPNGWriter, vtkPNGReader, vtkJPEGReader
+from vtkmodules.util.numpy_support import numpy_to_vtk
 
-from src.models.foot_model import FootModel
+from src.models.foot_model import FootModel, TextureData
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,16 @@ class VTK3DView(QWidget):
         self.measurement_visuals: dict = {}
         self.measurement_text_actor: Optional[vtkTextActor] = None
 
+        # Textura: la malla "plana" (posiciones, para picking/heatmap/mapa de
+        # calor) y la malla de render con textura (UV, más vértices en las
+        # costuras) son polydata separadas — se guarda la plana para poder
+        # volver a ella al apagar la textura, y la de textura se arma una
+        # sola vez (cacheada) la primera vez que se activa.
+        self._plain_polydata: Optional[vtkPolyData] = None
+        self._texture_polydata: Optional[vtkPolyData] = None
+        self._vtk_texture: Optional[vtkTexture] = None
+        self._texture_visible = False
+
         # Picking de puntos sobre la malla
         self.picker = vtkCellPicker()
         self.picker.SetTolerance(0.005)
@@ -165,6 +177,11 @@ class VTK3DView(QWidget):
         # Malla nueva: descartar plano/marcadores/medición de la malla anterior
         self.reset_measurements()
         self.enable_picking(False)
+        # La malla de textura es específica del modelo anterior: descartar el
+        # cache para que se reconstruya (o no) según la textura del nuevo modelo.
+        self._texture_polydata = None
+        self._vtk_texture = None
+        self._texture_visible = False
 
         self.current_model = model
         self.logger.info(f"Cargando malla: {model.num_vertices} vértices, {model.num_triangles} triángulos")
@@ -190,6 +207,19 @@ class VTK3DView(QWidget):
                     # escaneado no tiene bordes filosos reales, así que
                     # desactivarlo no cambia el shading visible.
                     normals_filter.SplittingOff()
+                    # ConsistencyOn (default) solo iguala el sentido de las
+                    # normales ENTRE sí, no determina cuál sentido es el
+                    # "hacia afuera" real: eso depende del orden de vértices
+                    # de cada cara en el archivo de origen. Distintos
+                    # exportadores (ej. STL vs OBJ de CrealityScan) usan
+                    # convenciones de winding distintas, así que sin
+                    # AutoOrientNormalsOn() una malla puede terminar con
+                    # todas las normales "para adentro" y mostrarse con el
+                    # color de cara trasera en vistas donde antes se veía
+                    # bien (visto con pie_mio_texturado.obj: la vista
+                    # plantar se pintaba del color cálido de backface).
+                    normals_filter.ConsistencyOn()
+                    normals_filter.AutoOrientNormalsOn()
                     normals_filter.Update()
                     poly_data = normals_filter.GetOutput()
                     self.logger.debug("Normales calculadas con vtkPolyDataNormals")
@@ -200,6 +230,7 @@ class VTK3DView(QWidget):
                 self.logger.debug("vtkPolyDataNormals no disponible - VTK calculará normales automáticamente")
 
             # Crear actor
+            self._plain_polydata = poly_data
             mapper = vtkPolyDataMapper()
             mapper.SetInputData(poly_data)
 
@@ -213,16 +244,22 @@ class VTK3DView(QWidget):
             prop.SetSpecularPower(20)
             prop.EdgeVisibilityOff()
 
-            # Color distinto para la cara posterior de cada triángulo: sirve
-            # para notar de un vistazo cuándo se está mirando la malla "del
-            # lado de adentro" (ej. confundir la parte superior con la
-            # inferior en un escaneo de una sola cara, como el de un pie
-            # apoyado sobre una placa). Requiere que las normales estén
-            # orientadas de forma consistente, que es justo lo que calcula
-            # vtkPolyDataNormals más arriba.
+            # NOTA: antes había un color distinto para la cara posterior
+            # (SetBackfaceProperty con tono cálido) para notar cuándo se
+            # miraba la malla "del lado de adentro". Se desactivó porque
+            # depende de que las normales estén orientadas de forma
+            # GLOBALMENTE consistente hacia afuera, algo que
+            # vtkPolyDataNormals (incluso con AutoOrientNormalsOn) no
+            # garantiza en escaneos reales no cerrados/no-manifold: con
+            # pie_mio_texturado.obj, toda la superficie plantar quedaba
+            # marcada como "cara posterior" y se pintaba de ese tono cálido
+            # en vez del gris esperado, justo la zona que más importa para
+            # medir. Mismo vtkProperty para ambas caras = comportamiento
+            # predecible sin importar el winding del archivo de origen.
             back_prop = vtkProperty()
-            back_prop.SetColor(0.85, 0.55, 0.4)  # Tono cálido, bien distinguible del gris frontal
-            back_prop.SetSpecular(0.1)
+            back_prop.SetColor(0.8, 0.8, 0.85)
+            back_prop.SetSpecular(0.3)
+            back_prop.SetSpecularPower(20)
             actor.SetBackfaceProperty(back_prop)
 
             # Remover actor anterior si existe
@@ -322,7 +359,6 @@ class VTK3DView(QWidget):
             )
             return
 
-        from vtkmodules.util.numpy_support import numpy_to_vtk
         from vtkmodules.vtkCommonCore import VTK_UNSIGNED_CHAR
 
         color_array = numpy_to_vtk(np.ascontiguousarray(colors), deep=True, array_type=VTK_UNSIGNED_CHAR)
@@ -344,6 +380,108 @@ class VTK3DView(QWidget):
 
         self.current_model.vertex_colors = None
         self.render_window.Render()
+
+    def has_texture(self) -> bool:
+        """Si el modelo cargado tiene textura disponible para mostrar"""
+        return self.current_model is not None and self.current_model.texture is not None
+
+    def set_texture_visible(self, visible: bool):
+        """
+        Mostrar/ocultar la textura del pie sobre la malla. La malla con
+        textura es una polydata separada de la "plana" (más vértices, por
+        las costuras de UV — ver `TextureData`); activar la textura
+        intercambia cuál polydata usa el mapper del actor, no modifica la
+        malla plana que usan el picking, el mapa de calor o las mediciones.
+
+        Args:
+            visible: True para mostrar la textura, False para volver al
+                     color sólido/mapa de calor
+        """
+        if self.mesh_actor is None or self.current_model is None:
+            return
+
+        mapper = self.mesh_actor.GetMapper()
+
+        if visible:
+            if self.current_model.texture is None:
+                self.logger.warning("El modelo actual no tiene textura cargada")
+                return
+            if self._texture_polydata is None:
+                self._texture_polydata, self._vtk_texture = self._build_texture_polydata(
+                    self.current_model.texture
+                )
+            mapper.SetInputData(self._texture_polydata)
+            mapper.ScalarVisibilityOff()
+            self.mesh_actor.SetTexture(self._vtk_texture)
+            self._texture_visible = True
+        else:
+            if self._plain_polydata is not None:
+                mapper.SetInputData(self._plain_polydata)
+            mapper.ScalarVisibilityOn()
+            self.mesh_actor.SetTexture(None)
+            self._texture_visible = False
+
+        self.render_window.Render()
+
+    def _build_texture_polydata(self, texture_data: TextureData) -> Tuple[vtkPolyData, vtkTexture]:
+        """
+        Armar la polydata de render con textura (posiciones expandidas +
+        UV) y el objeto `vtkTexture` con la imagen ya cargada. Se llama una
+        sola vez por modelo — el resultado se cachea en `_texture_polydata`
+        / `_vtk_texture`.
+        """
+        points = vtkPoints()
+        points.SetNumberOfPoints(len(texture_data.vertices))
+        for i, vertex in enumerate(texture_data.vertices):
+            points.SetPoint(i, float(vertex[0]), float(vertex[1]), float(vertex[2]))
+
+        triangles = vtkCellArray()
+        for face in texture_data.faces:
+            triangles.InsertNextCell(3)
+            triangles.InsertCellPoint(int(face[0]))
+            triangles.InsertCellPoint(int(face[1]))
+            triangles.InsertCellPoint(int(face[2]))
+
+        poly_data = vtkPolyData()
+        poly_data.SetPoints(points)
+        poly_data.SetPolys(triangles)
+
+        uv_array = numpy_to_vtk(np.ascontiguousarray(texture_data.uvs, dtype=np.float32), deep=True)
+        uv_array.SetNumberOfComponents(2)
+        poly_data.GetPointData().SetTCoords(uv_array)
+
+        if vtkPolyDataNormals is not None:
+            try:
+                normals_filter = vtkPolyDataNormals()
+                normals_filter.SetInputData(poly_data)
+                normals_filter.SetFeatureAngle(45.0)
+                normals_filter.SplittingOff()
+                # Ver comentario equivalente en load_mesh(): sin esto la
+                # orientación "hacia afuera" depende del winding del OBJ
+                # de origen, que puede no coincidir con lo que espera la
+                # cámara plantar/dorsal de la app.
+                normals_filter.ConsistencyOn()
+                normals_filter.AutoOrientNormalsOn()
+                normals_filter.Update()
+                poly_data = normals_filter.GetOutput()
+            except Exception as e:
+                self.logger.warning(f"No se pudieron calcular normales para la malla texturada: {e}")
+
+        ext = Path(texture_data.image_path).suffix.lower()
+        if ext == '.png':
+            reader = vtkPNGReader()
+        elif ext in ('.jpg', '.jpeg'):
+            reader = vtkJPEGReader()
+        else:
+            raise ValueError(f"Formato de imagen de textura no soportado: {ext}")
+        reader.SetFileName(texture_data.image_path)
+        reader.Update()
+
+        texture = vtkTexture()
+        texture.SetInputConnection(reader.GetOutputPort())
+        texture.InterpolateOn()
+
+        return poly_data, texture
 
     def draw_support_plane(
         self,

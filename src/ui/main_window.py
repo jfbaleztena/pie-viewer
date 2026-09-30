@@ -245,6 +245,12 @@ class MainWindow(QMainWindow):
         self.action_heatmap.triggered.connect(self._toggle_heatmap)
         toolbar.addAction(self.action_heatmap)
 
+        self.action_show_texture = QAction("Mostrar textura", self)
+        self.action_show_texture.setCheckable(True)
+        self.action_show_texture.setEnabled(False)
+        self.action_show_texture.triggered.connect(self._toggle_texture)
+        toolbar.addAction(self.action_show_texture)
+
     def _create_status_bar(self):
         """Crear barra de estado"""
         self.status_label = QLabel("Listo")
@@ -298,6 +304,10 @@ class MainWindow(QMainWindow):
         self.action_show_plane.setEnabled(False)
         self.action_heatmap.setChecked(False)
         self.action_heatmap.setEnabled(False)
+        # A diferencia del resto, la textura no depende del plano de apoyo —
+        # se puede ver apenas se carga la malla, si el archivo la trae.
+        self.action_show_texture.setChecked(False)
+        self.action_show_texture.setEnabled(self.canvas.has_texture())
         self.save_project_action.setEnabled(True)
         self.export_csv_action.setEnabled(True)
         self.export_pdf_action.setEnabled(True)
@@ -431,6 +441,11 @@ class MainWindow(QMainWindow):
                 )
                 self.action_heatmap.setChecked(False)
                 return
+            # El mapa de calor y la textura compiten por el mismo canal visual
+            # (colorean toda la superficie) — son mutuamente excluyentes.
+            if self.action_show_texture.isChecked():
+                self.action_show_texture.setChecked(False)
+                self.canvas.set_texture_visible(False)
             heights = compute_height_map(self.support_plane, self.current_model.vertices)
             colors = height_map_to_colors(heights)
             self.canvas.set_vertex_colors(colors)
@@ -439,6 +454,28 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.clear_vertex_colors()
             self.status_label.setText("Mapa de calor desactivado")
+
+    def _toggle_texture(self, checked: bool):
+        """Activar/desactivar la textura (foto del pie) sobre la malla"""
+        if checked:
+            if not self.canvas.has_texture():
+                QMessageBox.information(
+                    self,
+                    "Sin textura",
+                    "Esta malla no tiene textura cargada (el archivo no trae "
+                    "coordenadas UV, .mtl o imagen de textura válidos)."
+                )
+                self.action_show_texture.setChecked(False)
+                return
+            if self.action_heatmap.isChecked():
+                self.action_heatmap.setChecked(False)
+                self.canvas.clear_vertex_colors()
+            self.canvas.set_texture_visible(True)
+            self.status_label.setText("Textura activada")
+            logger.info("Textura activada")
+        else:
+            self.canvas.set_texture_visible(False)
+            self.status_label.setText("Textura desactivada")
 
     def _next_measurement_name(self, prefix: str) -> str:
         """Numerar mediciones del mismo tipo: 'Altura arco 1', 'Altura arco 2', etc."""

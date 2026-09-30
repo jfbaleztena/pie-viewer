@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Tuple, Optional, List
 import logging
 
-from src.models.foot_model import FootModel
+from src.models.foot_model import FootModel, TextureData
 from src.utils.constants import MAX_TRIANGLES, WARNING_TRIANGLES, GEOMETRY_TOLERANCE
 
 logger = logging.getLogger(__name__)
@@ -85,9 +85,10 @@ class MeshLoader:
 
         try:
             # Detectar formato por extensión: OBJ vs STL (ASCII o Binario)
+            texture = None
             if filepath_obj.suffix.lower() == '.obj':
                 self.logger.debug("Detectado formato OBJ")
-                vertices, faces = self._load_obj(filepath_obj)
+                vertices, faces, texture = self._load_obj(filepath_obj)
             elif self._is_ascii_stl(filepath_obj):
                 self.logger.debug("Detectado formato STL ASCII")
                 vertices, faces = self._load_ascii(filepath_obj)
@@ -103,7 +104,8 @@ class MeshLoader:
                 vertices=vertices,
                 faces=faces,
                 filepath=str(filepath),
-                filename=filepath_obj.name
+                filename=filepath_obj.name,
+                texture=texture,
             )
 
             # Calcular propiedades
@@ -126,6 +128,8 @@ class MeshLoader:
                 f"STL cargado exitosamente: {model.num_vertices} vértices, "
                 f"{model.num_triangles} triángulos"
             )
+            if model.texture is not None:
+                self.logger.info(f"Textura cargada: {model.texture.image_path}")
 
             return model
 
@@ -323,14 +327,15 @@ class MeshLoader:
         except Exception as e:
             raise STLParseError(f"Error parseando binario STL: {e}") from e
 
-    def _load_obj(self, filepath: Path) -> Tuple[np.ndarray, np.ndarray]:
+    def _load_obj(self, filepath: Path) -> Tuple[np.ndarray, np.ndarray, Optional[TextureData]]:
         """
         Parsear archivo OBJ (Wavefront)
 
         Soporta:
             v x y z        -> vértice
             vn nx ny nz    -> normal (ignorada, VTK las recalcula al renderizar)
-            vt u v         -> coordenada de textura (ignorada)
+            vt u v         -> coordenada de textura
+            mtllib archivo -> referencia al .mtl (para encontrar la imagen de textura)
             f a b c ...    -> cara (índices 1-based, o negativos relativos);
                               acepta 'a', 'a/vt', 'a/vt/vn' o 'a//vn' por vértice;
                               caras con más de 3 vértices se triangulan en abanico
@@ -338,17 +343,39 @@ class MeshLoader:
         A diferencia de STL, OBJ ya referencia vértices compartidos por índice,
         así que no hace falta deduplicar como en `_load_ascii`/`_load_binary`.
 
+        Si el archivo trae coordenadas de textura (`vt`) en todas las caras y
+        un `mtllib` que resuelve a una imagen existente, se arma además una
+        `TextureData` con una malla de render separada: las UV están
+        indexadas aparte de las posiciones (un mismo vértice de posición
+        puede necesitar varias UV distintas en las costuras del "unwrap" de
+        textura), así que esa malla puede tener más vértices que la de
+        posiciones puras — nunca se usa para mediciones, solo para mostrar
+        la textura.
+
         Args:
             filepath: Ruta del archivo
 
         Returns:
-            Tupla (vertices, faces) como numpy arrays
+            Tupla (vertices, faces, texture): `texture` es None si el
+            archivo no trae textura o si falta el .mtl/la imagen referenciada
+            (la textura es opcional: su ausencia no impide cargar ni medir)
 
         Raises:
-            OBJParseError: Si hay error al parsear
+            OBJParseError: Si hay error al parsear la geometría
         """
         vertices_list: List[Tuple[float, float, float]] = []
         faces_list: List[Tuple[int, int, int]] = []
+        texcoords_list: List[Tuple[float, float]] = []
+        mtllib_name: Optional[str] = None
+
+        # Malla de render con textura: se arma en paralelo a la de
+        # posiciones, deduplicando por el par (v_idx, vt_idx) de cada
+        # "corner" de cada cara — no alcanza con deduplicar solo por v_idx.
+        tex_vertex_dict: dict = {}
+        tex_vertices_list: List[Tuple[float, float, float]] = []
+        tex_uvs_list: List[Tuple[float, float]] = []
+        tex_faces_list: List[Tuple[int, int, int]] = []
+        all_faces_have_vt = True
 
         try:
             with open(filepath, 'r') as f:
@@ -369,22 +396,55 @@ class MeshLoader:
                         except ValueError as e:
                             raise OBJParseError(f"Coordenadas inválidas en línea {line_num}: {e}")
 
+                    elif tag == 'vt':
+                        if len(parts) < 3:
+                            raise OBJParseError(f"Coordenada de textura inválida en línea {line_num}: {line}")
+                        try:
+                            texcoords_list.append((float(parts[1]), float(parts[2])))
+                        except ValueError as e:
+                            raise OBJParseError(f"Coordenada de textura inválida en línea {line_num}: {e}")
+
+                    elif tag == 'mtllib':
+                        mtllib_name = line[len('mtllib'):].strip()
+
                     elif tag == 'f':
                         if len(parts) < 4:
                             raise OBJParseError(f"Cara inválida en línea {line_num}: {line}")
                         try:
-                            indices = [
-                                self._parse_obj_face_index(p, len(vertices_list))
+                            tokens = [
+                                self._parse_obj_face_token(p, len(vertices_list), len(texcoords_list))
                                 for p in parts[1:]
                             ]
                         except ValueError as e:
                             raise OBJParseError(f"Índice de cara inválido en línea {line_num}: {e}")
 
+                        indices = [v_idx for v_idx, _vt_idx in tokens]
                         # Triangulación en abanico para caras con más de 3 vértices
                         for i in range(1, len(indices) - 1):
                             faces_list.append((indices[0], indices[i], indices[i + 1]))
 
-                    # 'vn', 'vt', 'o', 'g', 's', 'mtllib', 'usemtl', etc. se ignoran
+                        # Misma triangulación para la malla de textura, si
+                        # todas las caras vistas hasta ahora traen vt.
+                        if all_faces_have_vt:
+                            if any(vt_idx is None for _v_idx, vt_idx in tokens):
+                                all_faces_have_vt = False
+                            else:
+                                tex_indices = []
+                                for v_idx, vt_idx in tokens:
+                                    key = (v_idx, vt_idx)
+                                    tex_idx = tex_vertex_dict.get(key)
+                                    if tex_idx is None:
+                                        tex_idx = len(tex_vertices_list)
+                                        tex_vertex_dict[key] = tex_idx
+                                        tex_vertices_list.append(vertices_list[v_idx])
+                                        tex_uvs_list.append(texcoords_list[vt_idx])
+                                    tex_indices.append(tex_idx)
+                                for i in range(1, len(tex_indices) - 1):
+                                    tex_faces_list.append(
+                                        (tex_indices[0], tex_indices[i], tex_indices[i + 1])
+                                    )
+
+                    # 'vn', 'o', 'g', 's', 'usemtl', etc. se ignoran
 
             if len(vertices_list) == 0:
                 raise OBJParseError("No se encontraron vértices en archivo OBJ")
@@ -394,37 +454,110 @@ class MeshLoader:
             vertices = np.array(vertices_list, dtype=np.float64)
             faces = np.array(faces_list, dtype=np.uint32)
 
-            return vertices, faces
+            texture = None
+            if all_faces_have_vt and texcoords_list and mtllib_name:
+                texture = self._resolve_obj_texture(
+                    filepath, mtllib_name, tex_vertices_list, tex_uvs_list, tex_faces_list
+                )
+
+            return vertices, faces, texture
 
         except OBJParseError:
             raise
         except Exception as e:
             raise OBJParseError(f"Error parseando OBJ: {e}") from e
 
-    @staticmethod
-    def _parse_obj_face_index(token: str, num_vertices: int) -> int:
+    def _resolve_obj_texture(
+        self,
+        obj_filepath: Path,
+        mtllib_name: str,
+        tex_vertices_list: List[Tuple[float, float, float]],
+        tex_uvs_list: List[Tuple[float, float]],
+        tex_faces_list: List[Tuple[int, int, int]],
+    ) -> Optional[TextureData]:
         """
-        Convertir un token de cara OBJ ('12', '12/5', '12//3', '12/5/3') al
-        índice 0-based de vértice.
+        Leer el .mtl referenciado por el OBJ para encontrar la imagen de
+        textura (`map_Kd`) y armar el `TextureData`. Cualquier problema acá
+        (falta el .mtl, no tiene map_Kd, falta la imagen) se resuelve
+        devolviendo None con un warning en el log — la textura es opcional,
+        nunca debe impedir cargar o medir la malla.
+        """
+        mtl_path = obj_filepath.parent / mtllib_name
+        if not mtl_path.exists():
+            self.logger.warning(f"No se encontró el archivo .mtl referenciado: {mtl_path}")
+            return None
+
+        image_name = None
+        try:
+            with open(mtl_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('map_Kd'):
+                        image_name = line[len('map_Kd'):].strip()
+                        break
+        except OSError as e:
+            self.logger.warning(f"No se pudo leer el archivo .mtl {mtl_path}: {e}")
+            return None
+
+        if image_name is None:
+            self.logger.warning(f"El archivo .mtl no tiene 'map_Kd': {mtl_path}")
+            return None
+
+        image_path = obj_filepath.parent / image_name
+        if not image_path.exists():
+            self.logger.warning(f"No se encontró la imagen de textura: {image_path}")
+            return None
+
+        return TextureData(
+            vertices=np.array(tex_vertices_list, dtype=np.float64),
+            uvs=np.array(tex_uvs_list, dtype=np.float64),
+            faces=np.array(tex_faces_list, dtype=np.uint32),
+            image_path=str(image_path),
+        )
+
+    @staticmethod
+    def _parse_obj_face_token(token: str, num_vertices: int, num_texcoords: int):
+        """
+        Parsear un token de cara OBJ ('12', '12/5', '12//3', '12/5/3').
 
         Args:
-            token: Token individual de la línea 'f' (referencia a vértice)
-            num_vertices: Cantidad de vértices leídos hasta el momento,
-                          usado para resolver índices negativos (relativos)
+            token: Token individual de la línea 'f'
+            num_vertices: Cantidad de vértices leídos hasta el momento
+            num_texcoords: Cantidad de coordenadas de textura leídas hasta el momento
 
         Returns:
-            Índice 0-based en la lista de vértices
+            Tupla (índice de vértice 0-based, índice de UV 0-based o None
+            si el token no incluye coordenada de textura)
+
+        Raises:
+            ValueError: Si algún índice es 0 o no numérico
+        """
+        parts = token.split('/')
+        v_idx = MeshLoader._parse_obj_index(parts[0], num_vertices)
+        vt_idx = None
+        if len(parts) >= 2 and parts[1] != '':
+            vt_idx = MeshLoader._parse_obj_index(parts[1], num_texcoords)
+        return v_idx, vt_idx
+
+    @staticmethod
+    def _parse_obj_index(token: str, count: int) -> int:
+        """
+        Convertir un índice OBJ (1-based, o negativo relativo) a 0-based.
+
+        Args:
+            token: El índice como string
+            count: Cantidad de elementos leídos hasta el momento, usado
+                   para resolver índices negativos (relativos)
 
         Raises:
             ValueError: Si el índice es 0 o el token no es numérico
         """
-        vertex_token = token.split('/')[0]
-        idx = int(vertex_token)
+        idx = int(token)
         if idx > 0:
             return idx - 1
         elif idx < 0:
-            return num_vertices + idx
-        raise ValueError(f"Índice de vértice inválido: {token}")
+            return count + idx
+        raise ValueError(f"Índice inválido: {token}")
 
     def _find_or_add_vertex(
         self,
