@@ -3,7 +3,9 @@ import pytest
 import os
 import tempfile
 import numpy as np
-from src.core.project_io import save_project, load_project
+from src.core.project_io import (
+    save_project, load_project, get_autosave_path, read_project_vertex_count, load_landmarks,
+)
 from src.models.foot_model import Measurement
 
 
@@ -59,6 +61,101 @@ class TestSaveLoadProject:
                 f.write('{"otra_cosa": 1}')
             with pytest.raises(ValueError):
                 load_project(filepath)
+
+
+class TestAutosaveHelpers:
+    def test_autosave_path_is_next_to_mesh_with_full_name(self):
+        path = get_autosave_path(os.path.join("carpeta", "pie.obj"))
+        assert path == os.path.join("carpeta", "pie.obj.pieviewer.json")
+
+    def test_stl_and_obj_with_same_stem_do_not_collide(self):
+        assert get_autosave_path("pie.stl") != get_autosave_path("pie.obj")
+
+    def test_vertex_count_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [], mesh_num_vertices=28014)
+            assert read_project_vertex_count(filepath) == 28014
+            _, plane, measurements = load_project(filepath)
+            assert plane is None and measurements == []
+
+    def test_vertex_count_missing_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [])
+            assert read_project_vertex_count(filepath) is None
+
+
+class TestLandmarks:
+    def test_round_trip(self):
+        landmarks = {
+            "metatarsal_1": np.array([10.0, 20.0, 30.0]),
+            "metatarsal_5": np.array([40.0, 50.0, 60.0]),
+            "heel_distal": np.array([1.5, 2.5, 3.5]),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [], landmarks=landmarks)
+            loaded = load_landmarks(filepath)
+            assert set(loaded) == set(landmarks)
+            for key in landmarks:
+                assert np.allclose(loaded[key], landmarks[key])
+
+    def test_partial_landmarks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [], landmarks={"heel_distal": np.array([1.0, 2.0, 3.0])})
+            assert list(load_landmarks(filepath)) == ["heel_distal"]
+
+    def test_project_without_landmarks_loads_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [])
+            assert load_landmarks(filepath) == {}
+
+    def test_old_project_file_without_landmarks_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "viejo.json")
+            with open(filepath, 'w') as f:
+                f.write('{"mesh_filepath": "pie.stl", "plane_points": null, "measurements": []}')
+            assert load_landmarks(filepath) == {}
+            assert load_project(filepath)[0] == "pie.stl"
+
+
+class TestLandmarks:
+    def test_round_trip(self):
+        landmarks = {
+            "metatarsal_1": np.array([10.0, 20.0, 30.0]),
+            "metatarsal_5": np.array([40.0, 50.0, 60.0]),
+            "heel_distal": np.array([1.5, 2.5, 3.5]),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [], landmarks=landmarks)
+            loaded = load_landmarks(filepath)
+            assert set(loaded) == set(landmarks)
+            for key in landmarks:
+                assert np.allclose(loaded[key], landmarks[key])
+
+    def test_partial_landmarks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [], landmarks={"heel_distal": np.array([1.0, 2.0, 3.0])})
+            assert list(load_landmarks(filepath)) == ["heel_distal"]
+
+    def test_project_without_landmarks_loads_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "p.json")
+            save_project(filepath, "pie.obj", None, [])
+            assert load_landmarks(filepath) == {}
+
+    def test_old_project_file_without_landmarks_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "viejo.json")
+            with open(filepath, 'w') as f:
+                f.write('{"mesh_filepath": "pie.stl", "plane_points": null, "measurements": []}')
+            assert load_landmarks(filepath) == {}
+            assert load_project(filepath)[0] == "pie.stl"
 
 
 if __name__ == '__main__':

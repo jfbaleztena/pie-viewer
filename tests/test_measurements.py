@@ -8,6 +8,7 @@ from src.core.measurements import (
     compute_plane_footprint,
     compute_height_map,
     height_map_to_colors,
+    intersect_ray_plane,
     MeasurementError,
 )
 
@@ -240,6 +241,29 @@ class TestHeightMapToColors:
     def test_empty_array(self):
         colors = height_map_to_colors(np.array([]))
         assert colors.shape == (0, 3)
+
+
+class TestIntersectRayPlane:
+    def test_ray_hits_horizontal_plane(self):
+        point = intersect_ray_plane([0, 0, 10], [0, 0, -1], [0, 0, 0], [0, 0, 1])
+        assert np.allclose(point, [0, 0, 0])
+
+    def test_oblique_ray(self):
+        point = intersect_ray_plane([0, 0, 10], [1, 0, -1], [0, 0, 0], [0, 0, 1])
+        assert np.allclose(point, [10, 0, 0])
+
+    def test_parallel_ray_returns_none(self):
+        assert intersect_ray_plane([0, 0, 10], [1, 0, 0], [0, 0, 0], [0, 0, 1]) is None
+
+    def test_plane_behind_ray_returns_none(self):
+        assert intersect_ray_plane([0, 0, 10], [0, 0, 1], [0, 0, 0], [0, 0, 1]) is None
+
+    def test_result_lies_on_tilted_plane(self):
+        plane = compute_support_plane(
+            np.array([0.0, 0.0, 0.0]), np.array([10.0, 0.0, 5.0]), np.array([0.0, 10.0, 0.0])
+        )
+        point = intersect_ray_plane([3, 4, 50], [0, 0, -1], plane.point1, plane.normal)
+        assert abs(plane.distance_to_point(point)) < 1e-9
 
 
 if __name__ == '__main__':

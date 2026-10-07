@@ -103,6 +103,55 @@ Git inicializado (`.git` no existe), así que no se generaron commits.
     deshabilitado. Pensado como paso previo a poder tomar medidas sobre una
     marca de tinta hecha en el pie antes de escanear (ver bug #10, que
     apareció al construir esta funcionalidad).
+25. **Vistas estándar reducidas a Dorsal e Isométrica** (panel, menú Ver y
+    toolbar). Se eliminaron anterior/posterior/plantar/medial/lateral (también
+    sus métodos en `VTK3DView`, que quedaron sin uso). La dorsal ahora usa
+    `view_up = (0, -1, 0)`: la imagen gira 180° y el escaneo queda con los
+    dedos hacia arriba y el talón hacia abajo.
+26. **Distancias sobre el plano, sin que el pie lo toque**: con "Mostrar
+    plano" activado, el modo "Medir distancia en el plano" ubica los 2 puntos
+    sobre el plano (intersección rayo de cámara ∩ plano,
+    `intersect_ray_plane()`) en vez de sobre la malla; con el plano oculto
+    sigue pickeando la malla como antes. Los dos extremos de cada distancia
+    se pueden **arrastrar** sobre el plano (mientras esté visible y no haya un
+    modo de picking activo): el valor, la tabla y el texto del canvas se
+    actualizan en vivo y se guarda al soltar. Los marcadores y la línea de
+    distancia se dibujan en una capa superior del renderer (`overlay_renderer`,
+    comparte cámara) porque si el pie no apoya en el plano, la propia malla los
+    tapaba. Un punto arrastrado deja de estar sobre la malla: queda sobre el
+    plano (la medida ya trabajaba con las proyecciones, así que no cambia).
+27. **Autoguardado de mediciones por malla**: cada cambio (plano, medición
+    nueva/borrada/renombrada/arrastrada) escribe `<malla>.pieviewer.json` al
+    lado del archivo de la malla (nombre completo con extensión, para que
+    `pie.stl` y `pie.obj` no se pisen). Al volver a abrir esa malla se
+    restauran plano y mediciones, con marcadores y líneas. El archivo guarda
+    la cantidad de vértices: si no coincide con la malla actual (se
+    volvió a escanear con el mismo nombre) se pregunta antes de restaurar.
+    `*.pieviewer.json` está en `.gitignore` (son datos de pacientes). El
+    aviso de "mediciones sin guardar" al cerrar solo aparece si el
+    autoguardado falló. "Guardar/Abrir proyecto" sigue existiendo para
+    exportar a otra ubicación.
+28. **Puntos de referencia anatómicos** (botones "Marcar metatarsianos" y
+    "Marcar talón distal", sin depender del plano de apoyo): metatarsianos
+    son 2 clicks sobre la malla, primero la cabeza del 1er y después la del
+    5to (amarillo y verde); el talón es 1 click en su punto más distal
+    (rojo). Los 3 puntos se guardan en la clave `landmarks` del JSON
+    (`metatarsal_1`, `metatarsal_5`, `heel_distal`, cada uno `[x, y, z]`),
+    tanto en el autoguardado como en "Guardar proyecto", y se restauran al
+    reabrir. Los 2 clicks de metatarsianos recién se confirman al segundo:
+    cancelar con `Escape` a mitad conserva los puntos anteriores, y `Ctrl+Z`
+    deshace el primer click. Volver a marcar reemplaza el punto previo. Un
+    resumen de cuáles están marcados se ve debajo de la tabla de mediciones.
+    Los puntos en sí todavía no entran en el CSV ni en el PDF.
+    Cuando los 3 están marcados se agregan solas 3 mediciones de distancia
+    recta 3D (no necesitan plano de apoyo): "Metatarsiano 1 - 5", "Talón -
+    Metatarsiano 1" y "Talón - Metatarsiano 5" (tipo `distancia_referencia`,
+    línea azul sobre la malla). Volver a marcar un punto las recalcula sin
+    duplicarlas y conservando el nombre si se renombró (se reconocen por
+    `Measurement.notes`, ej. `metatarsal_1|metatarsal_5`). Si el usuario borra
+    una, reaparece la próxima vez que vuelva a marcar un punto. Proyectos
+    guardados antes de esta función con los 3 puntos ya marcados no las
+    generan solos al abrirse: hay que volver a marcar un punto.
 
 ## Archivos nuevos
 
@@ -666,12 +715,16 @@ en vez de buscar el extremo sobre la malla completa sin filtrar.
 
 ## Tests
 
-72/72 tests pasan (22 preexistentes de Sprint 1 en `test_integration.py` y
-las clases no-OBJ de `test_mesh_loader.py` + 50 nuevos de este sprint: 25 en
+85/85 tests pasan (22 preexistentes de Sprint 1 en `test_integration.py` y
+las clases no-OBJ de `test_mesh_loader.py` + 63 nuevos de este sprint: 30 en
 `test_measurements.py` — plano, altura, distancia en el plano, footprint del
-plano, mapa de alturas y su gradiente de color —, 8 en `TestMeshLoaderOBJ`,
-7 en `TestMeshLoaderOBJTexture`, 7 en `test_report_export.py` y 4 en
-`test_project_io.py`).
+plano, mapa de alturas y su gradiente de color, intersección rayo-plano —,
+8 en `TestMeshLoaderOBJ`, 7 en `TestMeshLoaderOBJTexture`, 7 en
+`test_report_export.py` y 12 en `test_project_io.py`, incluyendo el
+autoguardado y los puntos de referencia). El flujo de UI (clicks sobre el plano, arrastre de un punto,
+autoguardado y restauración al reabrir la malla) se validó con un script
+`QTest` de clicks/arrastres reales sobre una copia de `pie_mio_texturado.obj`;
+no quedó como test permanente (ver "Pendiente").
 
 ```bash
 cd pie-viewer

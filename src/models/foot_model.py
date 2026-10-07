@@ -8,6 +8,17 @@ import numpy as np
 
 _measurement_id_counter = itertools.count(1)
 
+# Puntos de referencia anatómicos que marca el usuario sobre la malla (claves
+# estables, que van tal cual al JSON del proyecto, y su nombre para mostrar).
+LANDMARK_METATARSAL_1 = 'metatarsal_1'
+LANDMARK_METATARSAL_5 = 'metatarsal_5'
+LANDMARK_HEEL = 'heel_distal'
+LANDMARK_LABELS = {
+    LANDMARK_METATARSAL_1: "Cabeza 1er metatarsiano",
+    LANDMARK_METATARSAL_5: "Cabeza 5to metatarsiano",
+    LANDMARK_HEEL: "Punto distal del talón",
+}
+
 
 @dataclass
 class TextureData:

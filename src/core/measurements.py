@@ -12,6 +12,7 @@ Esta lógica se mantiene desacoplada de Qt/VTK (igual que MeshLoader) para
 poder testearla sin depender de un entorno gráfico.
 """
 import numpy as np
+from typing import Optional
 from src.models.foot_model import SupportPlane
 
 # Puntos casi colineales o coincidentes no definen un plano estable.
@@ -101,6 +102,35 @@ def compute_plane_distance(plane: SupportPlane, point_a: np.ndarray, point_b: np
     projected_a = plane.project_point(a)
     projected_b = plane.project_point(b)
     return float(np.linalg.norm(projected_b - projected_a))
+
+
+def intersect_ray_plane(
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    plane_point: np.ndarray,
+    plane_normal: np.ndarray,
+) -> Optional[np.ndarray]:
+    """
+    Punto donde un rayo (ej. el que sale de la cámara por el píxel clickeado)
+    corta a un plano. Permite ubicar puntos "sobre el plano" con el mouse
+    aunque no haya malla debajo del cursor.
+
+    Returns:
+        El punto de intersección, o None si el rayo es paralelo al plano o
+        el plano queda detrás del origen del rayo.
+    """
+    origin = np.asarray(ray_origin, dtype=np.float64)
+    direction = np.asarray(ray_direction, dtype=np.float64)
+    point = np.asarray(plane_point, dtype=np.float64)
+    normal = np.asarray(plane_normal, dtype=np.float64)
+
+    denominator = float(np.dot(normal, direction))
+    if abs(denominator) < 1e-12:
+        return None
+    t = float(np.dot(normal, point - origin)) / denominator
+    if t < 0:
+        return None
+    return origin + t * direction
 
 
 def compute_height_map(plane: SupportPlane, vertices: np.ndarray) -> np.ndarray:

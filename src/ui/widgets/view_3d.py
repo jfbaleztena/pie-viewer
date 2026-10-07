@@ -38,6 +38,7 @@ from vtkmodules.vtkFiltersSources import vtkSphereSource, vtkLineSource
 from vtkmodules.vtkIOImage import vtkPNGWriter, vtkPNGReader, vtkJPEGReader
 from vtkmodules.util.numpy_support import numpy_to_vtk
 
+from src.core.measurements import intersect_ray_plane
 from src.models.foot_model import FootModel, TextureData
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,10 @@ class VTK3DView(QWidget):
     # Señales
     point_selected = pyqtSignal(np.ndarray)  # Punto seleccionado en la malla
     mesh_loaded = pyqtSignal(FootModel)      # Malla cargada
+    # Un marcador de distancia se está arrastrando sobre el plano:
+    # (id de la medición, 0/1 = punto inicial/final, nueva posición)
+    marker_dragged = pyqtSignal(int, int, np.ndarray)
+    marker_drag_finished = pyqtSignal(int)   # Se soltó el marcador (id de la medición)
 
     def __init__(self, parent=None):
         """
@@ -92,6 +97,17 @@ class VTK3DView(QWidget):
         self.render_window = self.interactor.GetRenderWindow()
         self.renderer = vtkRenderer()
         self.render_window.AddRenderer(self.renderer)
+        # Capa superior (comparte la cámara): lo que se agrega acá se dibuja
+        # siempre por encima de la malla. Se usa para los puntos y líneas de
+        # distancia y la previsualización, que viven sobre el plano de apoyo
+        # y, si el pie no apoya en él, quedarían tapados por la propia malla.
+        self.overlay_renderer = vtkRenderer()
+        self.render_window.SetNumberOfLayers(2)
+        self.renderer.SetLayer(0)
+        self.overlay_renderer.SetLayer(1)
+        self.overlay_renderer.InteractiveOff()
+        self.overlay_renderer.SetActiveCamera(self.renderer.GetActiveCamera())
+        self.render_window.AddRenderer(self.overlay_renderer)
 
         # Estado
         self.current_model: Optional[FootModel] = None
@@ -123,6 +139,18 @@ class VTK3DView(QWidget):
         self._picking_enabled = False
         self._press_pos = None  # QPointF del último LeftButtonPress, o None
 
+        # Con el plano visible, los puntos se pueden ubicar sobre el plano
+        # (intersección rayo-plano) en vez de sobre la malla, y los marcadores
+        # de distancia se pueden arrastrar a lo largo de él.
+        self._pick_on_plane = False
+        self._plane_origin: Optional[np.ndarray] = None
+        self._plane_normal: Optional[np.ndarray] = None
+        # id de medición -> {'markers': [actor_inicial, actor_final], 'line': actor}
+        self._drag_targets: dict = {}
+        self._drag_state: Optional[Tuple[int, int]] = None  # (id medición, 0/1) mientras se arrastra
+        # Marcadores de los puntos de referencia (metatarsianos, talón), por clave
+        self.landmark_actors: dict = {}
+
         # Esfera de previsualización: sigue al cursor mientras hay un modo de
         # picking activo, mostrando dónde caería el click antes de hacerlo.
         # Se crea recién al primer hover (lazy) y se reposiciona in-place en
@@ -142,6 +170,10 @@ class VTK3DView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.interactor)
         self.setLayout(layout)
+
+        # El filtro queda instalado siempre: lo que hace cada evento depende de
+        # si el picking está activo o si hay marcadores arrastrables.
+        self.interactor.installEventFilter(self)
 
         # Configurar renderer
         self._setup_renderer()
@@ -571,6 +603,8 @@ class VTK3DView(QWidget):
                 self.renderer.RemoveActor(self.support_plane_actor)
 
             self.support_plane_actor = actor
+            self._plane_origin = np.asarray(plane_center, dtype=np.float64)
+            self._plane_normal = np.asarray(plane_normal, dtype=np.float64)
             self.renderer.AddActor(self.support_plane_actor)
 
             self.render_window.Render()
@@ -614,23 +648,69 @@ class VTK3DView(QWidget):
             enabled: True para activar picking, False para desactivar
         """
         if enabled and not self._picking_enabled:
-            self.interactor.installEventFilter(self)
             self._picking_enabled = True
+            self._set_drag_cursor(False)
         elif not enabled and self._picking_enabled:
-            self.interactor.removeEventFilter(self)
             self._picking_enabled = False
             self._press_pos = None
             self.hide_pick_preview()
 
+    def set_pick_on_plane(self, enabled: bool):
+        """
+        Hacer que los clicks (y la previsualización) caigan sobre el plano de
+        apoyo en vez de sobre la malla. Solo tiene efecto mientras el plano
+        existe y está visible; si está oculto se vuelve a pickear la malla.
+        """
+        self._pick_on_plane = enabled
+
+    def _plane_interaction_active(self) -> bool:
+        return (
+            self.support_plane_actor is not None
+            and self._plane_origin is not None
+            and bool(self.support_plane_actor.GetVisibility())
+        )
+
+    def _can_drag_markers(self) -> bool:
+        return (
+            not self._picking_enabled
+            and bool(self._drag_targets)
+            and self._plane_interaction_active()
+        )
+
     def eventFilter(self, obj, event):
         if obj is self.interactor:
             event_type = event.type()
-            if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            is_left = (
+                event_type in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease)
+                and event.button() == Qt.MouseButton.LeftButton
+            )
+            if event_type == QEvent.Type.MouseButtonPress and is_left:
+                if self._can_drag_markers():
+                    hit = self._find_marker_at(event.position())
+                    if hit is not None:
+                        self._drag_state = hit
+                        # Consumir el evento: si no, la cámara también rotaría.
+                        return True
                 self._press_pos = event.position()
-            elif event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            elif event_type == QEvent.Type.MouseButtonRelease and is_left:
+                if self._drag_state is not None:
+                    measurement_id = self._drag_state[0]
+                    self._drag_state = None
+                    self.marker_drag_finished.emit(measurement_id)
+                    return True
                 self._handle_click_release(event)
             elif event_type == QEvent.Type.MouseMove:
-                self._handle_hover_preview(event.position())
+                if self._drag_state is not None:
+                    point = self._plane_point_at(event.position())
+                    if point is not None:
+                        self._move_dragged_marker(point)
+                    return True
+                if self._picking_enabled:
+                    self._handle_hover_preview(event.position())
+                else:
+                    self._set_drag_cursor(
+                        self._can_drag_markers() and self._find_marker_at(event.position()) is not None
+                    )
             elif event_type == QEvent.Type.Leave:
                 self.hide_pick_preview()
         return super().eventFilter(obj, event)
@@ -646,13 +726,42 @@ class VTK3DView(QWidget):
         y = int(round((self.interactor.height() - pos.y() - 1) * scale))
         return x, y
 
+    def _display_to_world(self, x: float, y: float, depth: float) -> np.ndarray:
+        self.renderer.SetDisplayPoint(x, y, depth)
+        self.renderer.DisplayToWorld()
+        world = self.renderer.GetWorldPoint()
+        return np.array(world[:3]) / world[3]
+
+    def _world_to_display(self, point: np.ndarray) -> Tuple[float, float]:
+        self.renderer.SetWorldPoint(float(point[0]), float(point[1]), float(point[2]), 1.0)
+        self.renderer.WorldToDisplay()
+        display = self.renderer.GetDisplayPoint()
+        return display[0], display[1]
+
+    def _plane_point_at(self, pos) -> Optional[np.ndarray]:
+        """Punto del plano de apoyo bajo el cursor (rayo de cámara ∩ plano)"""
+        x, y = self._qt_pos_to_vtk_pixel(pos)
+        near = self._display_to_world(x, y, 0.0)
+        far = self._display_to_world(x, y, 1.0)
+        return intersect_ray_plane(near, far - near, self._plane_origin, self._plane_normal)
+
+    def _pick_point(self, pos) -> Optional[np.ndarray]:
+        """Punto 3D bajo el cursor: sobre el plano si corresponde, si no sobre la malla"""
+        if self._pick_on_plane and self._plane_interaction_active():
+            return self._plane_point_at(pos)
+        x, y = self._qt_pos_to_vtk_pixel(pos)
+        picked = self.picker.Pick(x, y, 0, self.renderer)
+        if picked and self.picker.GetCellId() != -1:
+            return np.array(self.picker.GetPickPosition())
+        return None
+
     def _handle_click_release(self, event) -> None:
         CLICK_TOLERANCE_PX = 3
 
         press_pos = self._press_pos
         self._press_pos = None
 
-        if press_pos is None or self.mesh_actor is None:
+        if not self._picking_enabled or press_pos is None or self.mesh_actor is None:
             return
 
         release_pos = event.position()
@@ -662,10 +771,8 @@ class VTK3DView(QWidget):
         if (dx * dx + dy * dy) ** 0.5 > CLICK_TOLERANCE_PX:
             return  # Fue un arrastre (rotación de cámara), no un click
 
-        x, y = self._qt_pos_to_vtk_pixel(release_pos)
-        picked = self.picker.Pick(x, y, 0, self.renderer)
-        if picked and self.picker.GetCellId() != -1:
-            position = np.array(self.picker.GetPickPosition())
+        position = self._pick_point(release_pos)
+        if position is not None:
             self.point_selected.emit(position)
 
     def _handle_hover_preview(self, pos) -> None:
@@ -673,12 +780,62 @@ class VTK3DView(QWidget):
         if self.mesh_actor is None:
             return
 
-        x, y = self._qt_pos_to_vtk_pixel(pos)
-        picked = self.picker.Pick(x, y, 0, self.renderer)
-        if picked and self.picker.GetCellId() != -1:
-            self.show_pick_preview(np.array(self.picker.GetPickPosition()))
+        position = self._pick_point(pos)
+        if position is not None:
+            self.show_pick_preview(position)
         else:
             self.hide_pick_preview()
+
+    def _set_drag_cursor(self, over_marker: bool):
+        if over_marker:
+            self.interactor.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.interactor.unsetCursor()
+
+    @staticmethod
+    def _source_of(actor: vtkActor):
+        return actor.GetMapper().GetInputConnection(0, 0).GetProducer()
+
+    def _find_marker_at(self, pos) -> Optional[Tuple[int, int]]:
+        """(id de medición, 0/1) del marcador de distancia más cercano al cursor, si hay uno cerca"""
+        MARKER_GRAB_RADIUS_PX = 14
+        x, y = self._qt_pos_to_vtk_pixel(pos)
+        threshold = MARKER_GRAB_RADIUS_PX * self.interactor.devicePixelRatioF()
+        best = None
+        for measurement_id, target in self._drag_targets.items():
+            for index, marker in enumerate(target['markers']):
+                mx, my = self._world_to_display(np.array(self._source_of(marker).GetCenter()))
+                distance = ((mx - x) ** 2 + (my - y) ** 2) ** 0.5
+                if distance <= threshold and (best is None or distance < best[0]):
+                    best = (distance, measurement_id, index)
+        return (best[1], best[2]) if best else None
+
+    def _project_to_plane(self, point: np.ndarray) -> np.ndarray:
+        offset = float(np.dot(point - self._plane_origin, self._plane_normal))
+        return point - offset * self._plane_normal
+
+    def _move_dragged_marker(self, point: np.ndarray):
+        """Mover el marcador arrastrado y redibujar la línea entre los dos extremos"""
+        measurement_id, index = self._drag_state
+        target = self._drag_targets[measurement_id]
+        self._source_of(target['markers'][index]).SetCenter(
+            float(point[0]), float(point[1]), float(point[2])
+        )
+        centers = [np.array(self._source_of(m).GetCenter()) for m in target['markers']]
+        start, end = (self._project_to_plane(c) for c in centers)
+        line = self._source_of(target['line'])
+        line.SetPoint1(*[float(c) for c in start])
+        line.SetPoint2(*[float(c) for c in end])
+        self.render_window.Render()
+        self.marker_dragged.emit(measurement_id, index, np.array(point))
+
+    def register_distance_drag(self, measurement_id: int, markers: List[vtkActor], line: vtkActor):
+        """
+        Hacer arrastrables (sobre el plano, mientras esté visible) los dos
+        marcadores de una medición de distancia. `markers` va en orden
+        [punto inicial, punto final]; `line` es la línea que los une.
+        """
+        self._drag_targets[measurement_id] = {'markers': list(markers), 'line': line}
 
     def show_pick_preview(self, point: np.ndarray):
         """
@@ -702,7 +859,7 @@ class VTK3DView(QWidget):
             actor.PickableOff()
 
             self._preview_marker_actor = actor
-            self.renderer.AddActor(actor)
+            self.overlay_renderer.AddActor(actor)
 
         self._preview_sphere_source.SetRadius(self._default_marker_radius())
         self._preview_sphere_source.SetCenter(float(point[0]), float(point[1]), float(point[2]))
@@ -723,7 +880,17 @@ class VTK3DView(QWidget):
             return max(diag * 0.01, 0.5)
         return 1.0
 
-    def add_marker(self, point: np.ndarray, color: Tuple[float, float, float] = (1.0, 0.2, 0.2)) -> vtkActor:
+    def _remove_actor(self, actor: vtkActor):
+        """Quitar un actor de donde esté (capa normal o superior)"""
+        self.renderer.RemoveActor(actor)
+        self.overlay_renderer.RemoveActor(actor)
+
+    def add_marker(
+        self,
+        point: np.ndarray,
+        color: Tuple[float, float, float] = (1.0, 0.2, 0.2),
+        on_top: bool = False,
+    ) -> vtkActor:
         """
         Crear un marcador esférico en un punto (feedback visual de picking).
         No lo asocia a ningún seguimiento por sí solo — el caller decide si
@@ -733,6 +900,7 @@ class VTK3DView(QWidget):
         Args:
             point: Punto 3D donde dibujar el marcador
             color: Color RGB (0-1)
+            on_top: Dibujarlo siempre por encima de la malla
 
         Returns:
             El actor VTK creado
@@ -754,9 +922,20 @@ class VTK3DView(QWidget):
         # vez de la malla real de abajo.
         actor.PickableOff()
 
-        self.renderer.AddActor(actor)
+        (self.overlay_renderer if on_top else self.renderer).AddActor(actor)
         self.render_window.Render()
         return actor
+
+    def set_landmark_marker(self, key: str, point: np.ndarray, color: Tuple[float, float, float]):
+        """Dibujar (o reemplazar) el marcador de un punto de referencia"""
+        self.remove_landmark_marker(key)
+        self.landmark_actors[key] = self.add_marker(point, color=color)
+
+    def remove_landmark_marker(self, key: str):
+        actor = self.landmark_actors.pop(key, None)
+        if actor is not None:
+            self._remove_actor(actor)
+            self.render_window.Render()
 
     def add_plane_marker(self, point: np.ndarray) -> vtkActor:
         """Marcador de uno de los 3 puntos usados para definir el plano de apoyo"""
@@ -767,7 +946,7 @@ class VTK3DView(QWidget):
     def clear_plane_markers(self):
         """Quitar los marcadores de los puntos que definen el plano de apoyo"""
         for actor in self.plane_marker_actors:
-            self.renderer.RemoveActor(actor)
+            self._remove_actor(actor)
         self.plane_marker_actors = []
         self.render_window.Render()
 
@@ -775,7 +954,7 @@ class VTK3DView(QWidget):
         """Quitar solo el último marcador de punto del plano agregado (para deshacer un click)"""
         if self.plane_marker_actors:
             actor = self.plane_marker_actors.pop()
-            self.renderer.RemoveActor(actor)
+            self._remove_actor(actor)
             self.render_window.Render()
 
     def register_measurement_visuals(self, measurement_id: int, actors: List[vtkActor]):
@@ -797,15 +976,16 @@ class VTK3DView(QWidget):
         registrarse con `register_measurement_visuals`).
         """
         for actor in actors:
-            self.renderer.RemoveActor(actor)
+            self._remove_actor(actor)
         if actors:
             self.render_window.Render()
 
     def remove_measurement(self, measurement_id: int):
         """Quitar del canvas todos los actores asociados a una medición puntual"""
         actors = self.measurement_visuals.pop(measurement_id, [])
+        self._drag_targets.pop(measurement_id, None)
         for actor in actors:
-            self.renderer.RemoveActor(actor)
+            self._remove_actor(actor)
         if actors:
             self.render_window.Render()
 
@@ -814,6 +994,7 @@ class VTK3DView(QWidget):
         point_a: np.ndarray,
         point_b: np.ndarray,
         color: Tuple[float, float, float] = (1.0, 0.8, 0.0),
+        on_top: bool = False,
     ) -> vtkActor:
         """
         Crear una línea entre dos puntos para visualizar una medición (altura
@@ -825,6 +1006,7 @@ class VTK3DView(QWidget):
             point_a: Primer extremo de la línea
             point_b: Segundo extremo de la línea
             color: Color RGB (0-1) de la línea
+            on_top: Dibujarla siempre por encima de la malla
 
         Returns:
             El actor VTK creado
@@ -842,7 +1024,7 @@ class VTK3DView(QWidget):
         actor.GetProperty().SetLineWidth(3)
         actor.PickableOff()
 
-        self.renderer.AddActor(actor)
+        (self.overlay_renderer if on_top else self.renderer).AddActor(actor)
         self.render_window.Render()
         return actor
 
@@ -881,9 +1063,16 @@ class VTK3DView(QWidget):
         if self.support_plane_actor is not None:
             self.renderer.RemoveActor(self.support_plane_actor)
             self.support_plane_actor = None
+        self._plane_origin = None
+        self._plane_normal = None
+        self._drag_targets = {}
+        self._drag_state = None
+        for actor in self.landmark_actors.values():
+            self._remove_actor(actor)
+        self.landmark_actors = {}
         for actors in self.measurement_visuals.values():
             for actor in actors:
-                self.renderer.RemoveActor(actor)
+                self._remove_actor(actor)
         self.measurement_visuals = {}
         self.clear_measurement_text()
         self.render_window.Render()
@@ -968,70 +1157,17 @@ class VTK3DView(QWidget):
         writer.Write()
         self.logger.info(f"Captura de pantalla guardada: {filepath}")
 
-    def set_view_anterior(self):
-        """Vista anterior (frontal)"""
-        if self.current_model is None:
-            return
-
-        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
-        position = center + np.array([0, 200, 0])
-        focal_point = center
-        view_up = np.array([0, 0, 1])
-        self._set_camera_view(position, focal_point, view_up)
-
-    def set_view_posterior(self):
-        """Vista posterior"""
-        if self.current_model is None:
-            return
-
-        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
-        position = center + np.array([0, -200, 0])
-        focal_point = center
-        view_up = np.array([0, 0, 1])
-        self._set_camera_view(position, focal_point, view_up)
-
-    def set_view_medial(self):
-        """Vista medial (desde adentro)"""
-        if self.current_model is None:
-            return
-
-        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
-        position = center + np.array([200, 0, 0])
-        focal_point = center
-        view_up = np.array([0, 0, 1])
-        self._set_camera_view(position, focal_point, view_up)
-
-    def set_view_lateral(self):
-        """Vista lateral (desde afuera)"""
-        if self.current_model is None:
-            return
-
-        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
-        position = center + np.array([-200, 0, 0])
-        focal_point = center
-        view_up = np.array([0, 0, 1])
-        self._set_camera_view(position, focal_point, view_up)
-
-    def set_view_plantar(self):
-        """Vista plantar (desde abajo)"""
-        if self.current_model is None:
-            return
-
-        center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
-        position = center + np.array([0, 0, -200])
-        focal_point = center
-        view_up = np.array([0, 1, 0])
-        self._set_camera_view(position, focal_point, view_up)
-
     def set_view_dorsal(self):
-        """Vista dorsal (desde arriba)"""
+        """Vista dorsal (desde arriba), con los dedos hacia arriba y el talón hacia abajo"""
         if self.current_model is None:
             return
 
         center = self.current_model.center if self.current_model.center is not None else np.array([0, 0, 0])
         position = center + np.array([0, 0, 200])
         focal_point = center
-        view_up = np.array([0, 1, 0])
+        # -Y arriba: gira la imagen 180° respecto de la convención anterior
+        # (+Y arriba), que dejaba los dedos hacia abajo en los escaneos.
+        view_up = np.array([0, -1, 0])
         self._set_camera_view(position, focal_point, view_up)
 
     def set_view_isometric(self):

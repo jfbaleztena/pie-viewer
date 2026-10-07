@@ -29,3 +29,6 @@ ENV/
 *.log
 .DS_Store
 *.stl
+
+# Mediciones autoguardadas junto a cada malla (datos de pacientes)
+*.pieviewer.json

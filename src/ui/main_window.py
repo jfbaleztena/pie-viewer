@@ -26,8 +26,12 @@ from src.core.measurements import (
     MeasurementError,
 )
 from src.core.report_export import export_measurements_csv, export_report_pdf
-from src.core.project_io import save_project, load_project
-from src.models.foot_model import Measurement
+from src.core.project_io import (
+    save_project, load_project, load_landmarks, get_autosave_path, read_project_vertex_count,
+)
+from src.models.foot_model import (
+    Measurement, LANDMARK_METATARSAL_1, LANDMARK_METATARSAL_5, LANDMARK_HEEL, LANDMARK_LABELS,
+)
 from src.ui.widgets.view_3d import VTK3DView
 
 logger = setup_logger(__name__)
@@ -40,6 +44,21 @@ HEIGHT_MARKER_COLOR = (1.0, 0.6, 0.0)
 HEIGHT_LINE_COLOR = (1.0, 0.8, 0.0)
 DISTANCE_MARKER_COLOR = (0.9, 0.2, 0.9)
 DISTANCE_LINE_COLOR = (0.2, 0.9, 0.5)
+# Distancias que se calculan solas cuando están marcados los 3 puntos de
+# referencia: (punto A, punto B, nombre de la medición). La clave "A|B" se
+# guarda en Measurement.notes para reconocerlas aunque el usuario las renombre.
+LANDMARK_DISTANCE_TYPE = 'distancia_referencia'
+LANDMARK_DISTANCE_LINE_COLOR = (0.2, 0.4, 1.0)
+LANDMARK_DISTANCES = [
+    (LANDMARK_METATARSAL_1, LANDMARK_METATARSAL_5, "Metatarsiano 1 - 5"),
+    (LANDMARK_HEEL, LANDMARK_METATARSAL_1, "Talón - Metatarsiano 1"),
+    (LANDMARK_HEEL, LANDMARK_METATARSAL_5, "Talón - Metatarsiano 5"),
+]
+LANDMARK_COLORS = {
+    LANDMARK_METATARSAL_1: (1.0, 0.95, 0.2),
+    LANDMARK_METATARSAL_5: (0.6, 1.0, 0.2),
+    LANDMARK_HEEL: (1.0, 0.3, 0.3),
+}
 
 
 class MainWindow(QMainWindow):
@@ -60,6 +79,11 @@ class MainWindow(QMainWindow):
         self._distance_points = []
         self._distance_marker_actors = []  # Marcadores del punto 1/2 de una distancia a medio pickear
         self.measurements = []  # Lista de Measurement (altura de arco, distancia en el plano)
+        # Puntos de referencia marcados por el usuario: clave (ver foot_model.LANDMARK_*) -> punto 3D
+        self.landmarks = {}
+        # Metatarsianos se marcan de a 2 clicks; recién se confirman al segundo
+        self._pending_metatarsal_points = []
+        self._pending_metatarsal_actors = []
         # True si hay mediciones/plano que todavía no se guardaron como proyecto
         self._unsaved_changes = False
         self._create_ui()
@@ -71,8 +95,32 @@ class MainWindow(QMainWindow):
         logger.info("MainWindow inicializada")
 
     def _mark_dirty(self):
-        """Marcar que hay cambios (plano/mediciones) sin guardar como proyecto"""
+        """
+        Registrar un cambio en el plano/las mediciones y guardarlo solo, junto
+        a la malla. Solo queda marcado como "sin guardar" si ese guardado
+        falla, para que al cerrar se ofrezca guardar a mano.
+        """
         self._unsaved_changes = True
+        self._autosave()
+
+    def _autosave(self):
+        """Escribir plano + mediciones en `<malla>.pieviewer.json`, junto al archivo de la malla"""
+        if self.current_file is None or self.current_model is None:
+            return
+        path = get_autosave_path(self.current_file)
+        plane_points = None
+        if self.support_plane is not None:
+            plane_points = [self.support_plane.point1, self.support_plane.point2, self.support_plane.point3]
+        try:
+            save_project(
+                path, self.current_file, plane_points, self.measurements,
+                mesh_num_vertices=self.current_model.num_vertices,
+                landmarks=self.landmarks,
+            )
+            self._unsaved_changes = False
+        except OSError as e:
+            logger.warning(f"No se pudo autoguardar las mediciones en {path}: {e}")
+            self.status_label.setText("No se pudieron guardar las mediciones automáticamente")
 
     def _create_ui(self):
         """Crear widgets principales"""
@@ -86,24 +134,9 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout()
         view_label = QLabel("Vistas Estándar:")
         right_layout.addWidget(view_label)
-        self.btn_anterior = QPushButton("Anterior (Punta)")
-        self.btn_anterior.clicked.connect(lambda: self.canvas.set_view_anterior())
-        right_layout.addWidget(self.btn_anterior)
-        self.btn_posterior = QPushButton("Posterior (Talón)")
-        self.btn_posterior.clicked.connect(lambda: self.canvas.set_view_posterior())
-        right_layout.addWidget(self.btn_posterior)
-        self.btn_plantar = QPushButton("Plantar (Abajo)")
-        self.btn_plantar.clicked.connect(lambda: self.canvas.set_view_plantar())
-        right_layout.addWidget(self.btn_plantar)
         self.btn_dorsal = QPushButton("Dorsal (Arriba)")
         self.btn_dorsal.clicked.connect(lambda: self.canvas.set_view_dorsal())
         right_layout.addWidget(self.btn_dorsal)
-        self.btn_medial = QPushButton("Medial (Interno)")
-        self.btn_medial.clicked.connect(lambda: self.canvas.set_view_medial())
-        right_layout.addWidget(self.btn_medial)
-        self.btn_lateral = QPushButton("Lateral (Externo)")
-        self.btn_lateral.clicked.connect(lambda: self.canvas.set_view_lateral())
-        right_layout.addWidget(self.btn_lateral)
         self.btn_isometric = QPushButton("Isométrica")
         self.btn_isometric.clicked.connect(lambda: self.canvas.set_view_isometric())
         right_layout.addWidget(self.btn_isometric)
@@ -122,6 +155,11 @@ class MainWindow(QMainWindow):
         self.measurement_table.customContextMenuRequested.connect(self._show_measurement_context_menu)
         self.measurement_table.itemChanged.connect(self._on_measurement_name_edited)
         right_layout.addWidget(self.measurement_table, 1)
+
+        self.landmarks_label = QLabel()
+        self.landmarks_label.setWordWrap(True)
+        right_layout.addWidget(self.landmarks_label)
+        self._refresh_landmarks_label()
 
         right_panel.setLayout(right_layout)
         right_panel.setMaximumWidth(260)
@@ -168,21 +206,9 @@ class MainWindow(QMainWindow):
         dorsal_action = QAction("Dorsal (Arriba)", self)
         dorsal_action.triggered.connect(lambda: self.canvas.set_view_dorsal())
         view_menu.addAction(dorsal_action)
-        plantar_action = QAction("Plantar (Abajo)", self)
-        plantar_action.triggered.connect(lambda: self.canvas.set_view_plantar())
-        view_menu.addAction(plantar_action)
-        medial_action = QAction("Medial (Interno)", self)
-        medial_action.triggered.connect(lambda: self.canvas.set_view_medial())
-        view_menu.addAction(medial_action)
-        lateral_action = QAction("Lateral (Externo)", self)
-        lateral_action.triggered.connect(lambda: self.canvas.set_view_lateral())
-        view_menu.addAction(lateral_action)
-        anterior_action = QAction("Anterior (Punta)", self)
-        anterior_action.triggered.connect(lambda: self.canvas.set_view_anterior())
-        view_menu.addAction(anterior_action)
-        posterior_action = QAction("Posterior (Talón)", self)
-        posterior_action.triggered.connect(lambda: self.canvas.set_view_posterior())
-        view_menu.addAction(posterior_action)
+        isometric_action = QAction("Isométrica", self)
+        isometric_action.triggered.connect(lambda: self.canvas.set_view_isometric())
+        view_menu.addAction(isometric_action)
         help_menu = menubar.addMenu("Ayuda")
         help_action = QAction("Acerca de", self)
         help_action.triggered.connect(self.show_about)
@@ -195,15 +221,9 @@ class MainWindow(QMainWindow):
         dorsal_action = QAction("Dorsal", self)
         dorsal_action.triggered.connect(lambda: self.canvas.set_view_dorsal())
         toolbar.addAction(dorsal_action)
-        plantar_action = QAction("Plantar", self)
-        plantar_action.triggered.connect(lambda: self.canvas.set_view_plantar())
-        toolbar.addAction(plantar_action)
-        medial_action = QAction("Medial", self)
-        medial_action.triggered.connect(lambda: self.canvas.set_view_medial())
-        toolbar.addAction(medial_action)
-        lateral_action = QAction("Lateral", self)
-        lateral_action.triggered.connect(lambda: self.canvas.set_view_lateral())
-        toolbar.addAction(lateral_action)
+        isometric_action = QAction("Isométrica", self)
+        isometric_action.triggered.connect(lambda: self.canvas.set_view_isometric())
+        toolbar.addAction(isometric_action)
 
         self.action_show_axes = QAction("Ejes", self)
         self.action_show_axes.setCheckable(True)
@@ -239,6 +259,20 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        self.action_mark_metatarsals = QAction("Marcar metatarsianos", self)
+        self.action_mark_metatarsals.setCheckable(True)
+        self.action_mark_metatarsals.setEnabled(False)
+        self.action_mark_metatarsals.triggered.connect(self._toggle_mark_metatarsals)
+        toolbar.addAction(self.action_mark_metatarsals)
+
+        self.action_mark_heel = QAction("Marcar talón distal", self)
+        self.action_mark_heel.setCheckable(True)
+        self.action_mark_heel.setEnabled(False)
+        self.action_mark_heel.triggered.connect(self._toggle_mark_heel)
+        toolbar.addAction(self.action_mark_heel)
+
+        toolbar.addSeparator()
+
         self.action_heatmap = QAction("Mapa de calor", self)
         self.action_heatmap.setCheckable(True)
         self.action_heatmap.setEnabled(False)
@@ -261,6 +295,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'canvas'):
             self.canvas.mesh_loaded.connect(self._on_mesh_loaded)
             self.canvas.point_selected.connect(self._on_point_picked)
+            self.canvas.marker_dragged.connect(self._on_marker_dragged)
+            self.canvas.marker_drag_finished.connect(self._on_marker_drag_finished)
 
     def _create_shortcuts(self):
         """Atajos de teclado: Escape cancela el picking activo, Supr borra la
@@ -293,6 +329,7 @@ class MainWindow(QMainWindow):
         self._distance_points = []
         self._distance_marker_actors = []
         self.measurements = []
+        self.canvas.set_pick_on_plane(False)
         self._rebuild_measurement_table()
         self.action_define_plane.setChecked(False)
         self.action_define_plane.setEnabled(True)
@@ -308,6 +345,15 @@ class MainWindow(QMainWindow):
         # se puede ver apenas se carga la malla, si el archivo la trae.
         self.action_show_texture.setChecked(False)
         self.action_show_texture.setEnabled(self.canvas.has_texture())
+        # Los puntos de referencia tampoco dependen del plano de apoyo.
+        self.landmarks = {}
+        self._pending_metatarsal_points = []
+        self._pending_metatarsal_actors = []
+        self._refresh_landmarks_label()
+        self.action_mark_metatarsals.setChecked(False)
+        self.action_mark_metatarsals.setEnabled(True)
+        self.action_mark_heel.setChecked(False)
+        self.action_mark_heel.setEnabled(True)
         self.save_project_action.setEnabled(True)
         self.export_csv_action.setEnabled(True)
         self.export_pdf_action.setEnabled(True)
@@ -340,9 +386,14 @@ class MainWindow(QMainWindow):
             self.action_define_plane,
             self.action_measure_height,
             self.action_measure_distance,
+            self.action_mark_metatarsals,
+            self.action_mark_heel,
         ):
             if action is not active_action and action.isChecked():
                 action.setChecked(False)
+        self._clear_pending_metatarsals()
+        # Cada modo vuelve a pedir el pick sobre el plano si lo necesita.
+        self.canvas.set_pick_on_plane(False)
 
     def _toggle_define_plane(self, checked: bool):
         """Activar/desactivar el modo de selección de 3 puntos para el plano de apoyo"""
@@ -411,13 +462,16 @@ class MainWindow(QMainWindow):
             self._set_pick_mode_exclusive(self.action_measure_distance)
             self._pick_mode = 'distance'
             self._distance_points = []
+            # Con el plano visible, los puntos se ubican sobre el plano (no
+            # hace falta que el pie esté apoyado en él); si está oculto, se
+            # pickea la malla como antes.
+            self.canvas.set_pick_on_plane(True)
             self.canvas.enable_picking(True)
-            self.status_label.setText(
-                "Distancia en el plano: click en 2 puntos de la superficie de apoyo (0/2)"
-            )
+            self.status_label.setText(self._distance_prompt(0))
         else:
             self._pick_mode = None
             self._distance_points = []
+            self.canvas.set_pick_on_plane(False)
             # Si ya se había clickeado el primer punto, su marcador queda
             # suelto (todavía no está asociado a ninguna Measurement) — hay
             # que limpiarlo a mano para no dejarlo huérfano en el canvas.
@@ -425,6 +479,136 @@ class MainWindow(QMainWindow):
             self._distance_marker_actors = []
             self.canvas.enable_picking(False)
             self.status_label.setText("Medición de distancia cancelada")
+
+    def _distance_prompt(self, n: int) -> str:
+        """Texto de ayuda del modo distancia (cambia según se pickee sobre el plano o la malla)"""
+        where = "sobre el plano" if self.action_show_plane.isChecked() else "de la superficie de apoyo"
+        return f"Distancia en el plano: click en 2 puntos {where} ({n}/2)"
+
+    def _refresh_landmarks_label(self):
+        """Resumen de qué puntos de referencia están marcados (panel derecho)"""
+        lines = ["Puntos de referencia:"]
+        for key in (LANDMARK_METATARSAL_1, LANDMARK_METATARSAL_5, LANDMARK_HEEL):
+            state = "marcado" if key in self.landmarks else "sin marcar"
+            lines.append(f"• {LANDMARK_LABELS[key]}: {state}")
+        self.landmarks_label.setText("\n".join(lines))
+
+    def _set_landmark(self, key: str, point: np.ndarray):
+        """Guardar un punto de referencia y dibujar su marcador (reemplaza uno previo)"""
+        self.landmarks[key] = np.asarray(point, dtype=np.float64)
+        self.canvas.set_landmark_marker(key, point, LANDMARK_COLORS[key])
+        self._refresh_landmarks_label()
+
+    def _landmarks_status(self, message: str) -> str:
+        if all(key in self.landmarks for key in LANDMARK_COLORS):
+            return f"{message}. Distancias entre los 3 puntos agregadas a las mediciones."
+        return message
+
+    def _update_landmark_distances(self):
+        """
+        Si ya están los 3 puntos de referencia, calcular (o recalcular, si se
+        volvió a marcar alguno) las 3 distancias rectas entre ellos y dejarlas
+        en la lista de mediciones. No necesita plano de apoyo: es distancia 3D
+        directa entre los puntos marcados.
+        """
+        if not all(key in self.landmarks for key in LANDMARK_COLORS):
+            return
+
+        for key_a, key_b, name in LANDMARK_DISTANCES:
+            pair_key = f"{key_a}|{key_b}"
+            point_a, point_b = self.landmarks[key_a], self.landmarks[key_b]
+            value = float(np.linalg.norm(point_b - point_a))
+
+            measurement = next(
+                (m for m in self.measurements
+                 if m.measurement_type == LANDMARK_DISTANCE_TYPE and m.notes == pair_key),
+                None,
+            )
+            if measurement is None:
+                measurement = Measurement(
+                    name=name, measurement_type=LANDMARK_DISTANCE_TYPE, value=value, unit='mm',
+                    point1=point_a, point2=point_b, notes=pair_key,
+                )
+                self.measurements.append(measurement)
+            else:
+                # Se conserva el nombre (puede haber sido renombrada a mano)
+                self.canvas.remove_measurement(measurement.id)
+                measurement.point1, measurement.point2, measurement.value = point_a, point_b, value
+
+            line = self.canvas.add_measurement_line(
+                point_a, point_b, color=LANDMARK_DISTANCE_LINE_COLOR, on_top=True
+            )
+            self.canvas.register_measurement_visuals(measurement.id, [line])
+
+        self._rebuild_measurement_table()
+        self._refresh_measurement_display()
+
+    def _metatarsal_prompt(self, n: int) -> str:
+        which = "1er" if n == 0 else "5to"
+        return f"Metatarsianos: click en la cabeza del {which} metatarsiano ({n + 1}/2)"
+
+    def _clear_pending_metatarsals(self):
+        """Descartar los clicks de metatarsianos todavía no confirmados (y sus marcadores)"""
+        if self._pending_metatarsal_actors:
+            self.canvas.remove_actors(self._pending_metatarsal_actors)
+        self._pending_metatarsal_points = []
+        self._pending_metatarsal_actors = []
+
+    def _toggle_mark_metatarsals(self, checked: bool):
+        """Marcar las cabezas del 1er y 5to metatarsiano (2 clicks, en ese orden)"""
+        if checked:
+            self._set_pick_mode_exclusive(self.action_mark_metatarsals)
+            self._pick_mode = 'metatarsals'
+            self.canvas.enable_picking(True)
+            self.status_label.setText(self._metatarsal_prompt(0))
+        else:
+            self._pick_mode = None
+            self._clear_pending_metatarsals()
+            self.canvas.enable_picking(False)
+            self.status_label.setText("Marcado de metatarsianos cancelado")
+
+    def _toggle_mark_heel(self, checked: bool):
+        """Marcar el punto distal (más posterior) del talón, 1 click"""
+        if checked:
+            self._set_pick_mode_exclusive(self.action_mark_heel)
+            self._pick_mode = 'heel'
+            self.canvas.enable_picking(True)
+            self.status_label.setText("Talón: click en el punto más distal (posterior) del talón")
+        else:
+            self._pick_mode = None
+            self.canvas.enable_picking(False)
+            self.status_label.setText("Marcado del talón cancelado")
+
+    def _on_metatarsal_point_picked(self, point: np.ndarray):
+        self._pending_metatarsal_points.append(point)
+        key = LANDMARK_METATARSAL_1 if len(self._pending_metatarsal_points) == 1 else LANDMARK_METATARSAL_5
+        self._pending_metatarsal_actors.append(self.canvas.add_marker(point, color=LANDMARK_COLORS[key]))
+
+        if len(self._pending_metatarsal_points) < 2:
+            self.status_label.setText(self._metatarsal_prompt(1))
+            return
+
+        first, fifth = self._pending_metatarsal_points
+        self._clear_pending_metatarsals()
+        self._set_landmark(LANDMARK_METATARSAL_1, first)
+        self._set_landmark(LANDMARK_METATARSAL_5, fifth)
+        self.canvas.enable_picking(False)
+        self.action_mark_metatarsals.setChecked(False)
+        self._pick_mode = None
+        self._update_landmark_distances()
+        self._mark_dirty()
+        self.status_label.setText(self._landmarks_status("Cabezas del 1er y 5to metatarsiano marcadas"))
+        logger.info("Metatarsianos marcados")
+
+    def _on_heel_point_picked(self, point: np.ndarray):
+        self._set_landmark(LANDMARK_HEEL, point)
+        self.canvas.enable_picking(False)
+        self.action_mark_heel.setChecked(False)
+        self._pick_mode = None
+        self._update_landmark_distances()
+        self._mark_dirty()
+        self.status_label.setText(self._landmarks_status("Punto distal del talón marcado"))
+        logger.info("Talón distal marcado")
 
     def _toggle_plane_visibility(self, checked: bool):
         """Mostrar/ocultar el plano de apoyo sin borrarlo ni afectar las mediciones"""
@@ -590,6 +774,12 @@ class MainWindow(QMainWindow):
         elif self.action_measure_distance.isChecked():
             self.action_measure_distance.setChecked(False)
             self._toggle_measure_distance(False)
+        elif self.action_mark_metatarsals.isChecked():
+            self.action_mark_metatarsals.setChecked(False)
+            self._toggle_mark_metatarsals(False)
+        elif self.action_mark_heel.isChecked():
+            self.action_mark_heel.setChecked(False)
+            self._toggle_mark_heel(False)
 
     def _handle_undo(self):
         """
@@ -610,9 +800,11 @@ class MainWindow(QMainWindow):
             if self._distance_marker_actors:
                 self.canvas.remove_actors([self._distance_marker_actors.pop()])
             n = len(self._distance_points)
-            self.status_label.setText(
-                f"Distancia en el plano: click en 2 puntos de la superficie de apoyo ({n}/2)"
-            )
+            self.status_label.setText(self._distance_prompt(n))
+        elif self._pick_mode == 'metatarsals' and self._pending_metatarsal_points:
+            self._pending_metatarsal_points.pop()
+            self.canvas.remove_actors([self._pending_metatarsal_actors.pop()])
+            self.status_label.setText(self._metatarsal_prompt(len(self._pending_metatarsal_points)))
         elif self.measurements:
             self._delete_measurement(self.measurements[-1].id)
 
@@ -624,6 +816,10 @@ class MainWindow(QMainWindow):
             self._on_height_point_picked(point)
         elif self._pick_mode == 'distance':
             self._on_distance_point_picked(point)
+        elif self._pick_mode == 'metatarsals':
+            self._on_metatarsal_point_picked(point)
+        elif self._pick_mode == 'heel':
+            self._on_heel_point_picked(point)
 
     def _on_plane_point_picked(self, point: np.ndarray):
         self._plane_points.append(point)
@@ -705,14 +901,12 @@ class MainWindow(QMainWindow):
 
     def _on_distance_point_picked(self, point: np.ndarray):
         self._distance_points.append(point)
-        marker = self.canvas.add_marker(point, color=DISTANCE_MARKER_COLOR)
+        marker = self.canvas.add_marker(point, color=DISTANCE_MARKER_COLOR, on_top=True)
         self._distance_marker_actors.append(marker)
         n = len(self._distance_points)
 
         if n < 2:
-            self.status_label.setText(
-                f"Distancia en el plano: click en 2 puntos de la superficie de apoyo ({n}/2)"
-            )
+            self.status_label.setText(self._distance_prompt(n))
             return
 
         point_a, point_b = self._distance_points
@@ -730,8 +924,9 @@ class MainWindow(QMainWindow):
         )
         self.measurements.append(measurement)
 
-        line = self.canvas.add_measurement_line(projected_a, projected_b, color=DISTANCE_LINE_COLOR)
+        line = self.canvas.add_measurement_line(projected_a, projected_b, color=DISTANCE_LINE_COLOR, on_top=True)
         self.canvas.register_measurement_visuals(measurement.id, self._distance_marker_actors + [line])
+        self.canvas.register_distance_drag(measurement.id, self._distance_marker_actors, line)
         self._distance_marker_actors = []
         self._add_measurement_row(measurement)
         self._refresh_measurement_display()
@@ -740,10 +935,47 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{measurement} agregada ({len(self.measurements)} mediciones en total)")
 
         self.canvas.enable_picking(False)
+        self.canvas.set_pick_on_plane(False)
         self.action_measure_distance.setChecked(False)
         self._pick_mode = None
         self._distance_points = []
         logger.info(f"{measurement.name} medida: {distance:.2f} mm")
+
+    def _on_marker_dragged(self, measurement_id: int, index: int, point: np.ndarray):
+        """Un extremo de una distancia se está arrastrando sobre el plano: recalcular valor en vivo"""
+        measurement = next((m for m in self.measurements if m.id == measurement_id), None)
+        if measurement is None or self.support_plane is None:
+            return
+        if index == 0:
+            measurement.point1 = point
+        else:
+            measurement.point2 = point
+        measurement.value = compute_plane_distance(
+            self.support_plane, measurement.point1, measurement.point2
+        )
+        self._update_measurement_row_value(measurement)
+        self._refresh_measurement_display()
+        self.status_label.setText(f"{measurement.name}: {measurement.value:.2f} {measurement.unit}")
+
+    def _on_marker_drag_finished(self, measurement_id: int):
+        """Se soltó un extremo arrastrado: guardar el nuevo valor"""
+        measurement = next((m for m in self.measurements if m.id == measurement_id), None)
+        if measurement is None:
+            return
+        self._mark_dirty()
+        logger.info(f"{measurement.name} ajustada a {measurement.value:.2f} mm")
+
+    def _update_measurement_row_value(self, measurement: Measurement):
+        """Actualizar solo la columna "Valor" de la fila de una medición ya listada"""
+        for row in range(self.measurement_table.rowCount()):
+            name_item = self.measurement_table.item(row, 0)
+            if name_item.data(Qt.ItemDataRole.UserRole) == measurement.id:
+                self.measurement_table.blockSignals(True)
+                try:
+                    self.measurement_table.item(row, 1).setText(f"{measurement.value:.2f} {measurement.unit}")
+                finally:
+                    self.measurement_table.blockSignals(False)
+                return
 
     def open_file(self):
         """Diálogo para abrir archivo STL u OBJ"""
@@ -769,6 +1001,7 @@ class MainWindow(QMainWindow):
                     f"{self.current_model.num_vertices} vértices, "
                     f"{self.current_model.num_triangles} triángulos"
                 )
+                self._restore_autosaved_session()
             except FileNotFoundError as e:
                 self.status_label.setText("Error: Archivo no encontrado")
                 QMessageBox.critical(self, "Error", f"Archivo no encontrado:\n{e}")
@@ -781,6 +1014,45 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Error: Fallo al cargar")
                 QMessageBox.critical(self, "Error", f"Error inesperado:\n{e}")
                 logger.error(f"Error inesperado: {e}")
+
+    def _restore_autosaved_session(self):
+        """Si esta malla ya tiene mediciones guardadas (ver `_autosave`), volver a mostrarlas"""
+        path = get_autosave_path(self.current_file)
+        if not Path(path).exists():
+            return
+
+        try:
+            saved_vertices = read_project_vertex_count(path)
+            _, plane, measurements = load_project(path)
+            landmarks = load_landmarks(path)
+        except (ValueError, KeyError, OSError, json.JSONDecodeError) as e:
+            logger.warning(f"No se pudieron leer las mediciones guardadas ({path}): {e}")
+            self.status_label.setText("No se pudieron leer las mediciones guardadas de esta malla")
+            return
+
+        if plane is None and not measurements and not landmarks:
+            return
+
+        if saved_vertices is not None and saved_vertices != self.current_model.num_vertices:
+            reply = QMessageBox.question(
+                self,
+                "La malla cambió",
+                f"Hay mediciones guardadas para este archivo, pero se tomaron sobre una malla de "
+                f"{saved_vertices} vértices y la actual tiene {self.current_model.num_vertices} "
+                "(¿se volvió a escanear?). Sobre una malla distinta pueden no corresponder.\n\n"
+                "¿Restaurarlas de todos modos? Si no, se reemplazarán cuando guardes mediciones nuevas.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self._restore_session(plane, measurements, landmarks)
+        self.status_label.setText(
+            f"Se restauraron {len(measurements)} mediciones y {len(landmarks)} puntos de referencia "
+            f"guardados de {Path(self.current_file).name}"
+        )
+        logger.info(f"Mediciones restauradas desde {path}")
 
     def export_measurements_csv_dialog(self):
         """Diálogo para exportar las mediciones actuales a un archivo CSV"""
@@ -850,7 +1122,11 @@ class MainWindow(QMainWindow):
             plane_points = [self.support_plane.point1, self.support_plane.point2, self.support_plane.point3]
 
         try:
-            save_project(filepath, self.current_file, plane_points, self.measurements)
+            save_project(
+                filepath, self.current_file, plane_points, self.measurements,
+                mesh_num_vertices=self.current_model.num_vertices,
+                landmarks=self.landmarks,
+            )
             self._unsaved_changes = False
             self.status_label.setText(f"Proyecto guardado: {Path(filepath).name}")
             logger.info(f"Proyecto guardado: {filepath}")
@@ -866,6 +1142,7 @@ class MainWindow(QMainWindow):
 
         try:
             mesh_filepath, plane, measurements = load_project(filepath)
+            landmarks = load_landmarks(filepath)
         except (ValueError, OSError, json.JSONDecodeError) as e:
             QMessageBox.critical(self, "Error", f"No se pudo leer el proyecto:\n{e}")
             logger.error(f"Error leyendo proyecto {filepath}: {e}")
@@ -894,6 +1171,21 @@ class MainWindow(QMainWindow):
         self.canvas.load_mesh(self.current_model)
         self.canvas.set_view_dorsal()
 
+        self._restore_session(plane, measurements, landmarks)
+        self._refresh_measurement_display()
+        self.status_label.setText(f"Proyecto cargado: {Path(filepath).name} ({len(measurements)} mediciones)")
+        logger.info(f"Proyecto cargado: {filepath}")
+
+    def _restore_session(self, plane, measurements, landmarks=None):
+        """
+        Volver a dibujar un plano de apoyo, una lista de mediciones ya
+        calculadas y los puntos de referencia (de un proyecto guardado o del
+        autoguardado) sobre la malla recién cargada. Asume que
+        `_on_mesh_loaded` ya reseteó el estado.
+        """
+        for key, point in (landmarks or {}).items():
+            if key in LANDMARK_COLORS:
+                self._set_landmark(key, point)
         if plane is not None:
             self.support_plane = plane
             center, width, height = compute_plane_footprint(plane, self.current_model.vertices)
@@ -915,15 +1207,19 @@ class MainWindow(QMainWindow):
             elif measurement.measurement_type == 'distancia_plano' and measurement.point1 is not None and self.support_plane is not None:
                 projected_a = self.support_plane.project_point(measurement.point1)
                 projected_b = self.support_plane.project_point(measurement.point2)
-                marker_a = self.canvas.add_marker(measurement.point1, color=DISTANCE_MARKER_COLOR)
-                marker_b = self.canvas.add_marker(measurement.point2, color=DISTANCE_MARKER_COLOR)
-                line = self.canvas.add_measurement_line(projected_a, projected_b, color=DISTANCE_LINE_COLOR)
+                marker_a = self.canvas.add_marker(measurement.point1, color=DISTANCE_MARKER_COLOR, on_top=True)
+                marker_b = self.canvas.add_marker(measurement.point2, color=DISTANCE_MARKER_COLOR, on_top=True)
+                line = self.canvas.add_measurement_line(projected_a, projected_b, color=DISTANCE_LINE_COLOR, on_top=True)
                 self.canvas.register_measurement_visuals(measurement.id, [marker_a, marker_b, line])
+                self.canvas.register_distance_drag(measurement.id, [marker_a, marker_b], line)
+            elif measurement.measurement_type == LANDMARK_DISTANCE_TYPE and measurement.point1 is not None:
+                line = self.canvas.add_measurement_line(
+                    measurement.point1, measurement.point2, color=LANDMARK_DISTANCE_LINE_COLOR, on_top=True
+                )
+                self.canvas.register_measurement_visuals(measurement.id, [line])
             self._add_measurement_row(measurement)
 
         self._refresh_measurement_display()
-        self.status_label.setText(f"Proyecto cargado: {Path(filepath).name} ({len(measurements)} mediciones)")
-        logger.info(f"Proyecto cargado: {filepath}")
 
     def show_about(self):
         """Mostrar diálogo Acerca de"""

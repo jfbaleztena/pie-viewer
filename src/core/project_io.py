@@ -13,12 +13,39 @@ mesh_loader.py y measurements.py.
 """
 import json
 import numpy as np
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from src.models.foot_model import Measurement, SupportPlane
 from src.core.measurements import compute_support_plane
 
 PROJECT_FORMAT_VERSION = 1
+
+AUTOSAVE_SUFFIX = '.pieviewer.json'
+
+
+def get_autosave_path(mesh_filepath: str) -> str:
+    """
+    Ruta del archivo de mediciones que se guarda solo, junto a la malla
+    (`pie.obj` -> `pie.obj.pieviewer.json`). Se usa el nombre completo de la
+    malla, extensión incluida, para que `pie.stl` y `pie.obj` en la misma
+    carpeta no se pisen entre sí.
+    """
+    mesh_path = Path(mesh_filepath)
+    return str(mesh_path.with_name(mesh_path.name + AUTOSAVE_SUFFIX))
+
+
+def read_project_vertex_count(filepath: str) -> Optional[int]:
+    """
+    Cantidad de vértices de la malla con la que se guardó el proyecto, o
+    None si el archivo no lo registra. Permite avisar antes de restaurar
+    mediciones sobre una malla que cambió (ej. se volvió a escanear con el
+    mismo nombre de archivo).
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    count = data.get('mesh_num_vertices')
+    return int(count) if count is not None else None
 
 
 def save_project(
@@ -26,6 +53,8 @@ def save_project(
     mesh_filepath: str,
     plane_points: Optional[List[np.ndarray]],
     measurements: List[Measurement],
+    mesh_num_vertices: Optional[int] = None,
+    landmarks: Optional[Dict[str, np.ndarray]] = None,
 ):
     """
     Guardar el estado de la sesión en un archivo JSON.
@@ -36,11 +65,17 @@ def save_project(
         plane_points: Los 3 puntos usados para definir el plano de apoyo, o
                       None/lista vacía si todavía no se definió
         measurements: Lista de Measurement a guardar
+        mesh_num_vertices: Cantidad de vértices de la malla, para poder
+                           detectar después si el archivo cambió
+        landmarks: Puntos de referencia marcados (clave -> punto 3D), ej.
+                   cabezas de metatarsianos y punto distal del talón
     """
     data = {
         'format_version': PROJECT_FORMAT_VERSION,
         'mesh_filepath': mesh_filepath,
+        'mesh_num_vertices': mesh_num_vertices,
         'plane_points': [np.asarray(p).tolist() for p in plane_points] if plane_points else None,
+        'landmarks': {key: np.asarray(point).tolist() for key, point in (landmarks or {}).items()},
         'measurements': [
             {
                 'name': m.name,
@@ -57,6 +92,20 @@ def save_project(
     }
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
+
+
+def load_landmarks(filepath: str) -> Dict[str, np.ndarray]:
+    """
+    Puntos de referencia guardados en un proyecto (clave -> punto 3D). Vacío
+    si el archivo no tiene ninguno (ej. proyectos guardados antes de que
+    existieran).
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return {
+        key: np.array(point, dtype=np.float64)
+        for key, point in (data.get('landmarks') or {}).items()
+    }
 
 
 def load_project(filepath: str) -> Tuple[str, Optional[SupportPlane], List[Measurement]]:
